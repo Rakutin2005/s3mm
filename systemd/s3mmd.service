@@ -1,0 +1,22 @@
+[Unit]
+Description=s3mm S3 replication daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/s3mmd -c /etc/s3mm/s3mm.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=s3mm
+CacheDirectory=s3mm
+StateDirectory=s3mm
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/etc/s3mm /var/cache/s3mm /run/s3mm
+PrivateTmp=true
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

@@ -107,7 +107,7 @@ Result<Rule> Rule::parse(Category category, const std::vector<std::string>& toke
     size_t i = 0;
     // optional order number
     if (auto num = str::parseInt64(tokens[0])) {
-        if (tokens.size() > 1 && (tokens[1] == "action" || categoryFromString(tokens[1]))) {
+        if (tokens.size() > 1) {
             rule.order = (int)*num;
             i = 1;
         }
@@ -130,6 +130,27 @@ Result<Rule> Rule::parse(Category category, const std::vector<std::string>& toke
     while (i < tokens.size() && tokens[i] != "action") {
         condTokens.push_back(tokens[i]);
         ++i;
+    }
+    // Join `field op value` triplets into single tokens ("size" ">=" "1M" -> "size>=1M")
+    // so the lexer's term parser can apply the operator.
+    {
+        static const char* const ops[] = {">=", "<=", "!=", "!~", "==", "=~", ">", "<", "=", "~"};
+        auto isOp = [&](const std::string& t) {
+            for (const char* o : ops) if (t == o) return true;
+            return false;
+        };
+        std::vector<std::string> joined;
+        size_t n = 0;
+        while (n < condTokens.size()) {
+            if (n + 2 < condTokens.size() && isOp(condTokens[n + 1])) {
+                joined.push_back(condTokens[n] + condTokens[n + 1] + condTokens[n + 2]);
+                n += 3;
+            } else {
+                joined.push_back(condTokens[n]);
+                ++n;
+            }
+        }
+        condTokens.swap(joined);
     }
     if (i < tokens.size() && tokens[i] == "action") ++i;
 

@@ -1,6 +1,8 @@
 #include "s3mm/s3/sigv4.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <ctime>
 #include <map>
 
 #include "s3mm/common/crypto.hpp"
@@ -90,7 +92,14 @@ SigningResult signAt(http::Request& request, const Credentials& creds, const std
 }
 
 SigningResult sign(http::Request& request, const Credentials& creds, const std::string& service, tm::TimePoint now) {
-    return signAt(request, creds, service, tm::toIso8601(now).substr(0, 19) + "Z");
+    std::time_t tt = tm::toSeconds(now);
+    std::tm tmv{};
+    ::gmtime_r(&tt, &tmv);
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%04d%02d%02dT%02d%02d%02dZ",
+                  tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+                  tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    return signAt(request, creds, service, buf);
 }
 
 } // namespace s3mm::sigv4

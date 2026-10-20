@@ -34,6 +34,6 @@ TEST(glob_match_filter) {
 
 TEST(glob_match_filter_list) {
     CHECK(glob::matchFilterList("logs/*,*.log", "logs/x"));
-    CHECK(glob::matchFilterList("logs/*,!logs/tmp/*", "logs/tmp/x"));
+    CHECK(!glob::matchFilterList("logs/*,!logs/tmp/*", "logs/tmp/x"));
     CHECK(!glob::matchFilterList("logs/*,!logs/tmp/*", "nope"));
 }

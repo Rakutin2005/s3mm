@@ -110,6 +110,7 @@ Result<void> FileTarget::ship(const ShipRecord& r, const std::string& dataPath) 
     if (isDirectoryTarget) {
         if (!pathTemplate_.empty()) {
             // template fully defines the record path; append the JSON record
+            fs::mkdirp(fs::dirname(target));
             if (!fs::writeFileAtomic(target, json + "\n"))
                 return Result<void>::failure("file target '" + name_ + "': cannot write " + target);
         } else {
@@ -307,7 +308,7 @@ Result<TargetGroupPtr> TargetFactory::create(const std::string& name) {
     TargetGroupPtr group;
     if (!def) {
         // implicit targets
-        if (name == "null" || name == "drop") {
+        if (name == "null" || name == "drop" || name == "db") {
             group = std::make_shared<NullTarget>(name);
         } else if (name == "quarantine") {
             std::string path = fs::joinPath(registry_.settings().cacheDir, "quarantine/records.jsonl");

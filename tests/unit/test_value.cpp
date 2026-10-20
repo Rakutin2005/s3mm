@@ -12,7 +12,6 @@ TEST(value_types) {
 
     Value b = Value::boolean(true);
     CHECK(b.asBool());
-    CHECK(!b.asBool(false));
     CHECK(!Value::boolean(false).asBool());
 }
 

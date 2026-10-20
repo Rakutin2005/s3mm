@@ -47,16 +47,19 @@ std::string urlEncode(const std::string& s, bool encodeSlash) {
 std::string buildUrl(const std::string& base, const std::string& path,
                      const std::map<std::string, std::string>& query) {
     std::string out = base;
-    while (!out.empty() && out.back() == '/') out.pop_back();
-    out += "/";
     if (!path.empty()) {
-        if (path[0] == '/') out += path.substr(1);
-        else out += path;
+        while (!out.empty() && out.back() == '/') out.pop_back();
+        if (path[0] != '/') out += "/";
+        out += path;
     }
     if (!query.empty()) {
+        size_t scheme = out.find("://");
+        size_t slash = (scheme == std::string::npos) ? std::string::npos : out.find('/', scheme + 3);
+        if (slash == std::string::npos) out += "/";
+        out += "?";
         bool first = true;
         for (const auto& [k, v] : query) {
-            out += first ? "?" : "&";
+            if (!first) out += "&";
             first = false;
             out += urlEncode(k, true) + "=" + urlEncode(v, true);
         }

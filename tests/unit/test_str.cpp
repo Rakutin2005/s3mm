@@ -19,7 +19,7 @@ TEST(str_split) {
     CHECK_EQ(parts[2], std::string(""));
     auto noEmpty = str::split("a,b,,c", ',', false);
     CHECK_EQ(noEmpty.size(), 3u);
-    auto ws = str::split("one   two\tthree", ' ', false);
+    auto ws = str::splitWS("one   two\tthree");
     CHECK_EQ(ws.size(), 3u);
 }
 
@@ -43,9 +43,9 @@ TEST(str_tokenize) {
     CHECK_EQ(toks.size(), 3u);
     CHECK_EQ(toks[2], std::string("100 name=big object size >= 1M action accept"));
     auto esc = str::tokenize("a\\ b \"c d\"");
-    CHECK_EQ(esc.size(), 3u);
+    CHECK_EQ(esc.size(), 2u);
     CHECK_EQ(esc[0], std::string("a b"));
-    CHECK_EQ(esc[2], std::string("c d"));
+    CHECK_EQ(esc[1], std::string("c d"));
 }
 
 TEST(str_join_lower_upper) {

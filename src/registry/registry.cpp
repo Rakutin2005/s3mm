@@ -1,4 +1,5 @@
 #include "s3mm/registry/registry.hpp"
+#include <cstdio>
 
 #include <algorithm>
 #include <sstream>
@@ -255,10 +256,22 @@ Result<Registry> Registry::fromConfig(const config::Config& cfg) {
     registry.bundles_["drop-all"] = policy::Bundle::builtin("drop-all");
     registry.bundles_["default"] = policy::Bundle::builtin("default");
 
+    // Credentials must be available before clusters (addCluster validates them),
+    // so parse credential blocks first regardless of their order in the file.
+    std::vector<const Node*> credNodes, otherNodes;
     for (const auto& c : root.children) {
+        if (c.name == "credential" && c.block) credNodes.push_back(&c);
+        else otherNodes.push_back(&c);
+    }
+    for (const Node* np : credNodes) {
+        const Node& c = *np;
+        auto res = registry.parseCredential(c);
+        if (!res) return Result<Registry>::failure(res.error());
+    }
+    for (const Node* np : otherNodes) {
+        const Node& c = *np;
         Result<void> res = Result<void>::success();
         if (c.name == "cluster" && c.block) res = registry.parseCluster(c);
-        else if (c.name == "credential" && c.block) res = registry.parseCredential(c);
         else if (c.name == "policy" && c.block) res = registry.parsePolicy(c);
         else if (c.name == "replication" && c.block) res = registry.parseReplication(c);
         else if (c.name == "target" && c.block) res = registry.parseTarget(c);

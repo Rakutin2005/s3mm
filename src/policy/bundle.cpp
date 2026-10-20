@@ -52,13 +52,14 @@ Result<void> Bundle::addRule(Rule rule, const std::string& before, const std::st
         const Rule* ref = findRule(before);
         if (!ref) return Result<void>("no rule '" + before + "' in policy '" + name + "'");
         int refOrder = ref->order;
-        int prevOrder = refOrder - 10;
-        auto it = std::upper_bound(rules.begin(), rules.end(), refOrder,
-                                   [](int v, const Rule& r) { return v < r.order; });
-        if (it != rules.begin()) prevOrder = std::prev(it)->order;
-        int candidate = (prevOrder + refOrder) / 2;
-        if (candidate <= prevOrder || candidate >= refOrder) {
-            // no room: shift the rest
+        int prevOrder = 0;
+        for (const auto& r : rules)
+            if (r.order < refOrder && r.order > prevOrder) prevOrder = r.order;
+        int candidate;
+        if (prevOrder + 1 < refOrder) {
+            candidate = (prevOrder + refOrder) / 2;
+            if (candidate <= prevOrder) candidate = prevOrder + 1;
+        } else {
             for (auto& r : rules)
                 if (r.order >= refOrder) r.order += 10;
             candidate = refOrder;
@@ -69,11 +70,13 @@ Result<void> Bundle::addRule(Rule rule, const std::string& before, const std::st
         if (!ref) return Result<void>("no rule '" + after + "' in policy '" + name + "'");
         int refOrder = ref->order;
         int nextOrderVal = refOrder + 10;
-        auto it = std::upper_bound(rules.begin(), rules.end(), refOrder,
-                                   [](int v, const Rule& r) { return v < r.order; });
-        if (it != rules.end()) nextOrderVal = it->order;
-        int candidate = (refOrder + nextOrderVal) / 2;
-        if (candidate <= refOrder || candidate >= nextOrderVal) {
+        for (const auto& r : rules)
+            if (r.order > refOrder && r.order < nextOrderVal) nextOrderVal = r.order;
+        int candidate;
+        if (refOrder + 1 < nextOrderVal) {
+            candidate = (refOrder + nextOrderVal) / 2;
+            if (candidate <= refOrder) candidate = refOrder + 1;
+        } else {
             for (auto& r : rules)
                 if (r.order > refOrder) r.order += 10;
             candidate = refOrder + 1;
@@ -167,14 +170,14 @@ Result<Bundle> Bundle::fromNode(const config::Node& node) {
     for (const auto& c : node.children) {
         if (c.name == "default_action") {
             if (c.args.size() < 2)
-                return Result<Bundle>(c.file + ":" + std::to_string(c.line) + ": default_action requires <category> <action>");
+                return Result<Bundle>::failure(c.file + ":" + std::to_string(c.line) + ": default_action requires <category> <action>");
             auto cat = categoryFromString(c.args[0]);
             if (!cat)
-                return Result<Bundle>(c.file + ":" + std::to_string(c.line) + ": unknown category '" + c.args[0] + "'");
+                return Result<Bundle>::failure(c.file + ":" + std::to_string(c.line) + ": unknown category '" + c.args[0] + "'");
             Action a;
             a.name = c.args[1];
             if (!findActionSpec(a.name))
-                return Result<Bundle>(c.file + ":" + std::to_string(c.line) + ": unknown action '" + a.name + "'");
+                return Result<Bundle>::failure(c.file + ":" + std::to_string(c.line) + ": unknown action '" + a.name + "'");
             for (size_t i = 2; i < c.args.size(); ++i) {
                 auto eq = c.args[i].find('=');
                 if (eq == std::string::npos) {
@@ -182,7 +185,7 @@ Result<Bundle> Bundle::fromNode(const config::Node& node) {
                         findActionSpec(a.name)->positional)
                         a.positional = c.args[i];
                     else
-                        return Result<Bundle>(c.file + ":" + std::to_string(c.line) + ": expected key=value, got '" + c.args[i] + "'");
+                        return Result<Bundle>::failure(c.file + ":" + std::to_string(c.line) + ": expected key=value, got '" + c.args[i] + "'");
                 } else {
                     a.params[c.args[i].substr(0, eq)] = c.args[i].substr(eq + 1);
                 }
@@ -192,28 +195,30 @@ Result<Bundle> Bundle::fromNode(const config::Node& node) {
         }
         if (c.name == "default_route") {
             if (c.args.size() < 2)
-                return Result<Bundle>(c.file + ":" + std::to_string(c.line) + ": default_route requires <outcome> <target>");
+                return Result<Bundle>::failure(c.file + ":" + std::to_string(c.line) + ": default_route requires <outcome> <target>");
             const std::string& outcome = c.args[0];
             const std::string& target = c.args[1];
             if (outcome == "denied") b.routes.denied = target;
             else if (outcome == "warning") b.routes.warning = target;
             else if (outcome == "success") b.routes.success = target;
             else
-                return Result<Bundle>(c.file + ":" + std::to_string(c.line) + ": default_route outcome must be denied|warning|success");
+                return Result<Bundle>::failure(c.file + ":" + std::to_string(c.line) + ": default_route outcome must be denied|warning|success");
             continue;
         }
         if (c.name == "rule") {
-            auto parsed = Rule::parse(Category::Object, c.args);
-            if (!parsed) return Result<Bundle>(c.file + ":" + std::to_string(c.line) + ": " + parsed.error());
+            Result<Rule> parsed = c.args.size() == 1
+                ? Rule::parseLine(c.args[0])
+                : Rule::parse(Category::Object, c.args);
+            if (!parsed) return Result<Bundle>::failure(c.file + ":" + std::to_string(c.line) + ": " + parsed.error());
             Rule rule = parsed.value();
             rule.file = c.file;
             rule.line = c.line;
             auto res = b.addRule(std::move(rule));
-            if (!res) return Result<Bundle>(c.file + ":" + std::to_string(c.line) + ": " + res.error());
+            if (!res) return Result<Bundle>::failure(c.file + ":" + std::to_string(c.line) + ": " + res.error());
             continue;
         }
         if (c.name == "include") continue;
-        return Result<Bundle>(c.file + ":" + std::to_string(c.line) + ": unknown directive '" + c.name + "' inside policy block");
+        return Result<Bundle>::failure(c.file + ":" + std::to_string(c.line) + ": unknown directive '" + c.name + "' inside policy block");
     }
     for (auto cat : {Category::Access, Category::Bucket, Category::Object})
         if (!b.defaults.count(cat)) b.defaults[cat] = Action{"accept", {}, {}};
