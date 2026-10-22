@@ -6,6 +6,8 @@
 #include "s3mm/rest/router.hpp"
 #include "s3mm/rest/loader.hpp"
 #include "s3mm/rest/module.hpp"
+#include "s3mm/registry/registry.hpp"
+#include "s3mm/s3/client.hpp"
 #include "s3mm/cli/client.hpp"
 
 namespace s3mm::rest {
@@ -28,6 +30,8 @@ private:
     Options options_;
     cli::Client daemonClient_;
     RestModuleLoader loader_;
+    std::unique_ptr<registry::Registry> registry_;
+    std::unique_ptr<s3::Client> makeClient(const std::string& clusterName);
     std::vector<IRestModule*> modules_;
     Router router_;
     HttpServer http_;
