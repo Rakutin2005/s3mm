@@ -15,9 +15,11 @@
 //   POST   /idp/builtin/policy/attach      body: {"policies":[...], "user": K}
 //   POST   /idp/builtin/policy/detach      body: {"policies":[...], "user": K}
 #include "s3mm/module/module.hpp"
+#include "s3mm/module/iam_export.hpp"
 
 #include <algorithm>
 #include <random>
+#include <set>
 
 #include "s3mm/common/log.hpp"
 #include "s3mm/common/str.hpp"
@@ -116,10 +118,24 @@ public:
         f.tagging = true;
         f.inventory = false;
         f.iamPolicy = true;
+        f.policyDetach = true;
+        f.groups = true;
         return f;
     }
 
     Result<std::vector<Account>> listAccounts() override {
+        // export-iam is the only RustFS endpoint that exposes the secret keys;
+        // list-users returns metadata only, which made account sync invent
+        // random secrets on the destination.
+        http::Response exported = call("GET", "/export-iam");
+        if (exported.ok() && exported.body.size() >= 2 && exported.body.compare(0, 2, "PK") == 0) {
+            auto accounts = parseIamExport(exported.body, "rustfs");
+            if (accounts) return accounts;
+            LOG_WARN(accounts.error());
+        } else if (exported.ok()) {
+            LOG_WARN("rustfs export-iam: unexpected response (not a ZIP)");
+        }
+
         http::Response r = call("GET", "/list-users");
         if (!r.ok()) return Result<std::vector<Account>>::failure(fail("list-users", r));
         std::string err;
@@ -256,6 +272,35 @@ public:
         return Result<void>::success();
     }
 
+    Result<void> detachPolicy(const std::string& accessKey,
+                              const std::string& policyName) override {
+        Value body = Value::object();
+        Value arr = Value::array();
+        arr.push(Value::str(policyName));
+        body.set("policies", std::move(arr));
+        body.set("user", Value::str(accessKey));
+        http::Response r = call("POST", "/idp/builtin/policy/detach", {}, body.toJson(0));
+        if (!r.ok() && r.status != 404) return Result<void>::failure(fail("detach-policy", r));
+        return Result<void>::success();
+    }
+
+    Result<void> setGroups(const std::string& accessKey, const std::vector<std::string>& desired,
+                           const std::vector<std::string>& current) override {
+        std::set<std::string> want(desired.begin(), desired.end());
+        std::set<std::string> have(current.begin(), current.end());
+        for (const auto& group : have) {
+            if (want.count(group)) continue;
+            auto res = updateGroup(group, accessKey, true);
+            if (!res) return res;
+        }
+        for (const auto& group : want) {
+            if (have.count(group)) continue;
+            auto res = updateGroup(group, accessKey, false);
+            if (!res) return res;
+        }
+        return Result<void>::success();
+    }
+
     Result<void> deleteAccount(const std::string& accessKey) override {
         http::Response r = call("DELETE", "/remove-user", {{"accessKey", accessKey}});
         if (!r.ok()) return Result<void>::failure(fail("remove-user", r));
@@ -285,6 +330,19 @@ private:
             msg += r.body.substr(0, 512);
         }
         return msg;
+    }
+
+    Result<void> updateGroup(const std::string& group, const std::string& accessKey, bool remove) {
+        Value body = Value::object();
+        body.set("group", Value::str(group));
+        Value members = Value::array();
+        members.push(Value::str(accessKey));
+        body.set("members", std::move(members));
+        body.set("groupStatus", Value::str("enabled"));
+        body.set("isRemove", Value::boolean(remove));
+        http::Response r = call("PUT", "/update-group-members", {}, body.toJson(0));
+        if (!r.ok()) return Result<void>::failure(fail("update-group-members", r));
+        return Result<void>::success();
     }
 
     Result<void> putUser(const std::string& accessKey, const std::string& secret,

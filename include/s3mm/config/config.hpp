@@ -40,6 +40,9 @@ public:
     /// Same but throws ConfigError when missing.
     std::string valueRequired(const std::string& directive) const;
     bool boolValue(const std::string& directive, bool fallback) const;
+    /// Parse this directive's own first argument as a boolean flag
+    /// (`path_style off;`, `delete_propagation on;`, ...).
+    bool boolFlag(bool fallback) const;
     int64_t int64Value(const std::string& directive, int64_t fallback) const;
 
     /// Re-render this subtree back into s3mm.conf syntax (used by `s3mm flush-config`).

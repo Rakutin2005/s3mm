@@ -25,6 +25,7 @@ struct ShipRecord {
     std::string account;
     uint64_t size = 0;
     std::string etag;
+    std::string versionId;
     tm::TimePoint lastModified;
     std::string contentType;
     std::map<std::string, std::string> meta;

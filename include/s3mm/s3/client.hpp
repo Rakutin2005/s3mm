@@ -1,6 +1,7 @@
 #pragma once
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
@@ -35,6 +36,13 @@ struct BucketInfo {
     tm::TimePoint created;
 };
 
+/// One entry of ListObjectVersions (a real version or a delete marker).
+struct ObjectVersion {
+    std::string key;
+    std::string versionId; // may be "null" or empty for unversioned buckets
+    bool deleteMarker = false;
+};
+
 struct AclGrant {
     std::string permission;   // READ|WRITE|READ_ACP|WRITE_ACP|FULL_CONTROL|...
     std::string granteeType;  // CanonicalUser|Group|AmazonCustomerByEmail
@@ -57,10 +65,16 @@ struct ObjectMeta {
     std::string etag;
     tm::TimePoint lastModified;
     std::string contentType;
+    std::string contentEncoding;
+    std::string contentLanguage;
+    std::string contentDisposition;
+    std::string cacheControl;
+    std::string expires;
     std::string storageClass;
     std::string versionId;
     int parts = 0; // 0 = single part
     std::map<std::string, std::string> userMeta;
+    std::map<std::string, std::string> tags;
 };
 
 struct ClientOptions {
@@ -104,21 +118,33 @@ public:
                                        const std::string& delimiter = {}, const std::string& token = {},
                                        int maxKeys = 1000);
     Result<std::vector<ObjectInfo>> listAllObjects(const std::string& bucket, const std::string& prefix = {});
+    /// Stream the object list page by page instead of accumulating every entry.
+    Result<void> forEachObject(const std::string& bucket, const std::string& prefix,
+                               const std::function<Result<void>(const ObjectInfo&)>& callback);
+    /// Stream every version/delete marker of a bucket, including non-current ones.
+    Result<void> forEachObjectVersion(
+        const std::string& bucket,
+        const std::function<Result<void>(const ObjectVersion&)>& callback);
     Result<ObjectMeta> headObject(const std::string& bucket, const std::string& key);
     Result<std::string> getObjectRange(const std::string& bucket, const std::string& key, uint64_t offset,
                                        uint64_t length);
+    Result<BucketTagging> getObjectTagging(const std::string& bucket, const std::string& key);
+    Result<void> putObjectTagging(const std::string& bucket, const std::string& key,
+                                  const BucketTagging& tagging);
+    Result<void> deleteObjectTagging(const std::string& bucket, const std::string& key);
+    /// Write an object together with the HTTP metadata, user metadata and tags
+    /// carried by `meta`. `meta.size/etag/...` are ignored here.
     Result<void> putObject(const std::string& bucket, const std::string& key, const std::string& body,
-                           const std::string& contentType = {}, const std::map<std::string, std::string>& userMeta = {});
+                           const ObjectMeta& meta = {});
     /// Streaming PUT (uses UNSIGNED-PAYLOAD) — for objects up to partSize.
     Result<void> putObjectFromFile(const std::string& bucket, const std::string& key, const std::string& path,
-                                   const std::string& contentType = {},
-                                   const std::map<std::string, std::string>& userMeta = {});
+                                   const ObjectMeta& meta = {});
     /// Multipart upload from a local file; returns ETag of the completed upload.
     Result<std::string> uploadMultipartFromFile(const std::string& bucket, const std::string& key,
                                                 const std::string& path, uint64_t partSize,
-                                                const std::string& contentType = {},
-                                                const std::map<std::string, std::string>& userMeta = {});
-    Result<void> deleteObject(const std::string& bucket, const std::string& key);
+                                                const ObjectMeta& meta = {});
+    Result<void> deleteObject(const std::string& bucket, const std::string& key,
+                              const std::string& versionId = {});
     Result<std::string> copyObject(const std::string& fromBucket, const std::string& fromKey,
                                    const std::string& toBucket, const std::string& toKey);
 

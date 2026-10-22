@@ -60,7 +60,7 @@ Result<void> Registry::parseSettings(const Node& node) {
             else if (c.name == "master_key_file") settings_.masterKeyFile = c.argRequired(0);
             else if (c.name == "worker_count") settings_.workerCount = (int)c.int64Value("worker_count", 0);
             else if (c.name == "metrics") settings_.metricsListen = c.argRequired(0);
-            else if (c.name == "permanent") settings_.permanent = c.boolValue("permanent", false);
+            else if (c.name == "permanent") settings_.permanent = c.boolFlag(false);
             else if (c.name == "queue") {
                 auto r = parseQueueBlock(c);
                 if (!r) return r;
@@ -102,8 +102,8 @@ Result<void> Registry::parseCluster(const Node& node) {
         try {
             if (d.name == "addr" || d.name == "endpoint") c.endpoints.push_back(d.argRequired(0));
             else if (d.name == "alias") c.alias = d.argRequired(0);
-            else if (d.name == "path_style") c.pathStyle = d.boolValue("path_style", true);
-            else if (d.name == "insecure") c.insecure = d.boolValue("insecure", false);
+            else if (d.name == "path_style") c.pathStyle = d.boolFlag(true);
+            else if (d.name == "insecure") c.insecure = d.boolFlag(false);
             else if (d.name == "vendor") c.vendor = d.argRequired(0);
             else if (d.name == "zone") c.zone = d.argRequired(0);
             else if (d.name == "credential" || d.name == "credentials") {
@@ -145,7 +145,7 @@ Result<void> Registry::parseCredential(const Node& node) {
                 c.secretIsPlain = false;
             } else if (d.name == "session_token") c.sessionToken = d.argRequired(0);
             else if (d.name == "region") c.region = d.argRequired(0);
-            else if (d.name == "read_only") c.readOnly = d.boolValue("read_only", false);
+            else if (d.name == "read_only") c.readOnly = d.boolFlag(false);
             else return Result<void>::failure(loc(d) + ": unknown directive '" + d.name + "' in credential '" + c.name + "'");
         } catch (const Error& e) {
             return Result<void>::failure(loc(d) + ": " + e.what());
@@ -177,9 +177,10 @@ Result<void> Registry::parseReplication(const Node& node) {
             else if (d.name == "accounts" || d.name == "account") r.accounts = argList(d);
             else if (d.name == "policy") r.policy = d.argRequired(0);
             else if (d.name == "retention") { r.retentionSec = units::parseDurationSeconds(d.argOr(0, "0")); r.deletePropagation = r.retentionSec > 0; }
-            else if (d.name == "delete_propagation") r.deletePropagation = d.boolValue("delete_propagation", false);
+            else if (d.name == "delete_propagation") r.deletePropagation = d.boolFlag(false);
             else if (d.name == "scan_every") r.scanEverySec = units::parseDurationSeconds(d.argOr(0, "5m"));
-            else if (d.name == "paused") r.paused = d.boolValue("paused", false);
+            else if (d.name == "metadata_every") r.metadataEverySec = units::parseDurationSeconds(d.argOr(0, "5m"));
+            else if (d.name == "paused") r.paused = d.boolFlag(false);
             else if (d.name == "queue") {
                 for (const auto& q : d.children) {
                     if (q.name == "size") r.queueSizeBytes = (int64_t)units::parseSize(q.argOr(0, "1G"));
@@ -611,6 +612,8 @@ std::string Registry::dumpReplication(const Replication& r) const {
     if (r.retentionSec > 0) os << "    retention " << units::formatDuration(r.retentionSec * 1000) << ";\n";
     if (r.deletePropagation) os << "    delete_propagation on;\n";
     if (r.scanEverySec > 0) os << "    scan_every " << units::formatDuration(r.scanEverySec * 1000) << ";\n";
+    if (r.metadataEverySec != 300)
+        os << "    metadata_every " << units::formatDuration(r.metadataEverySec * 1000) << ";\n";
     if (r.queueSizeBytes || r.queuePeriodSec || r.minSizeBytes || r.maxDiskBytes) {
         os << "    queue {\n";
         if (r.queueSizeBytes) os << "        size " << units::formatSize((uint64_t)r.queueSizeBytes) << ";\n";

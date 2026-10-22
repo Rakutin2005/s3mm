@@ -55,6 +55,7 @@ struct Replication {
     int64_t minSizeBytes = 0;
     int64_t maxDiskBytes = 0;
     int scanEverySec = 0;
+    int64_t metadataEverySec = 300; // re-read tags/HTTP metadata; 0 => only on content changes
     bool paused = false;
 };
 

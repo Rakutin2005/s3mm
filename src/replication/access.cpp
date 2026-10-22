@@ -127,17 +127,23 @@ namespace {
 
 /// Compare two account views; append the differing actions to `actions`.
 std::vector<std::string> diffAccounts(const module::Account& source, const module::Account& dest,
-                                      bool sourceHasSecret) {
+                                      bool sourceHasSecret, const module::FeatureSet& destFeatures) {
     std::vector<std::string> actions;
     if (!source.status.empty() && source.status != dest.status) actions.emplace_back("status");
     if (sourceHasSecret && dest.hasSecret && !source.secretKey.empty() && source.secretKey != dest.secretKey)
         actions.emplace_back("secret");
     if (source.buckets != dest.buckets) actions.emplace_back("grants");
-    // policies: only additions are propagated (the destination may carry vendor managed policies)
     for (const auto& p : source.policies) {
         if (std::find(dest.policies.begin(), dest.policies.end(), p) == dest.policies.end())
-            actions.push_back("policy:" + p);
+            actions.push_back("policy+:" + p);
     }
+    if (destFeatures.policyDetach) {
+        for (const auto& p : dest.policies) {
+            if (std::find(source.policies.begin(), source.policies.end(), p) == source.policies.end())
+                actions.push_back("policy-:" + p);
+        }
+    }
+    if (destFeatures.groups && source.groups != dest.groups) actions.emplace_back("groups");
     return actions;
 }
 
@@ -154,6 +160,7 @@ Result<SyncReport> AccountSync::sync(const registry::Replication& replication, b
     if (!sourceAdmin) return Result<SyncReport>::failure(sourceAdmin.error());
     auto destAdmin = adminFor(*destination);
     if (!destAdmin) return Result<SyncReport>::failure(destAdmin.error());
+    const module::FeatureSet destFeatures = destAdmin.value()->features();
 
     auto sourceList = sourceAdmin.value()->listAccounts();
     if (!sourceList) return Result<SyncReport>::failure(sourceList.error());
@@ -192,11 +199,15 @@ Result<SyncReport> AccountSync::sync(const registry::Replication& replication, b
             change.actions.emplace_back("create");
             if (src.hasSecret) change.actions.emplace_back("secret");
             if (!src.buckets.empty()) change.actions.emplace_back("grants");
-            for (const auto& p : src.policies) change.actions.push_back("policy:" + p);
+            for (const auto& p : src.policies) change.actions.push_back("policy+:" + p);
+            if (destFeatures.groups && !src.groups.empty()) change.actions.emplace_back("groups");
 
             bool ok = apply(change, [&] { return destAdmin.value()->createAccount(src); });
             if (ok && !src.buckets.empty() && !dryRun)
                 ok = apply(change, [&] { return destAdmin.value()->setBucketAccess(src.accessKey, src.buckets); });
+            if (ok && destFeatures.groups && !src.groups.empty() && !dryRun) {
+                ok = apply(change, [&] { return destAdmin.value()->setGroups(src.accessKey, src.groups, {}); });
+            }
             if (ok && !dryRun) {
                 for (const auto& p : src.policies) {
                     auto res = destAdmin.value()->attachPolicy(src.accessKey, p);
@@ -215,7 +226,7 @@ Result<SyncReport> AccountSync::sync(const registry::Replication& replication, b
             continue;
         }
 
-        std::vector<std::string> actions = diffAccounts(src, destIt->second, src.hasSecret);
+        std::vector<std::string> actions = diffAccounts(src, destIt->second, src.hasSecret, destFeatures);
         if (actions.empty()) {
             report.matched++;
             continue;
@@ -232,7 +243,17 @@ Result<SyncReport> AccountSync::sync(const registry::Replication& replication, b
                 ok = ok && apply(change, [&] { return destAdmin.value()->setSecret(src.accessKey, src.secretKey); });
             else if (action == "grants")
                 ok = ok && apply(change, [&] { return destAdmin.value()->setBucketAccess(src.accessKey, src.buckets); });
-            else if (str::startsWith(action, "policy:")) {
+            else if (action == "groups")
+                ok = ok && apply(change, [&] {
+                    return destAdmin.value()->setGroups(src.accessKey, src.groups, destIt->second.groups);
+                });
+            else if (str::startsWith(action, "policy+:")) {
+                std::string policy = action.substr(std::strlen("policy+:"));
+                ok = ok && apply(change, [&] { return destAdmin.value()->attachPolicy(src.accessKey, policy); });
+            } else if (str::startsWith(action, "policy-:")) {
+                std::string policy = action.substr(std::strlen("policy-:"));
+                ok = ok && apply(change, [&] { return destAdmin.value()->detachPolicy(src.accessKey, policy); });
+            } else if (str::startsWith(action, "policy:")) {
                 std::string policy = action.substr(std::strlen("policy:"));
                 ok = ok && apply(change, [&] { return destAdmin.value()->attachPolicy(src.accessKey, policy); });
             }

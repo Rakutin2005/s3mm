@@ -15,10 +15,47 @@ logs exclusively to syslog (RFC 5424), runs under systemd, and keeps all state u
   `pass`. First matching rule wins; three result baskets `denied` / `warning` /
   `success`.
 - Delta replication via `ListObjects` + a persistent TSV cache, with size/time
-  thresholds and optional S3 Inventory.
+  thresholds. Object listings are streamed page-by-page, and tags / HTTP
+  metadata are re-checked every `metadata_every` interval (default `5m`).
+- Full object metadata propagation: `Content-Type`, `Content-Encoding`,
+  `Content-Language`, `Content-Disposition`, `Cache-Control`, `Expires`,
+  `x-amz-storage-class`, user metadata and object tags.
+- `delete_propagation on` mirrors object deletes and bucket deletions. A
+  deleted bucket is purged of **all** versions and delete markers (including
+  versioned destinations) before the bucket itself is removed.
+- Account sync uses MinIO/RustFS `export-iam` (plaintext ZIP) to preserve
+  secrets and policy mappings, mirrors direct policies and group memberships,
+  and never deletes accounts unless `sync-accounts --prune` is requested.
 - Vendor code only in loadable `.so` modules: `minio`, `aws`, `ceph`, `rustfs`.
 - Firewall-style CLI (`s3mm`) with one-shot and `--permanent` mutations,
   `flush-config`, `-t` validation, table/json/yaml output.
+
+## Replication semantics
+
+```text
+replication photos {
+    source minio1;
+    destination aws1;
+    buckets media*,!media/tmp/*;
+    accounts team-*;
+    policy default;
+    delete_propagation on;
+    retention 1h;        # optional delay for object and bucket deletes
+    scan_every 5m;
+    metadata_every 5m;   # re-read tags/HTTP metadata; 0 disables
+}
+```
+
+- Bearer credentials are replicated first, then buckets/objects. Bucket
+  settings (versioning, policy, tags) are only copied when the bucket policy
+  contains `propagate settings=true`.
+- `retention` delays delete propagation; a missing bucket is remembered on
+  disk (`buckets.deleted`) so a restart does not reset the window.
+- Scheduled account sync is non-pruning. Destination-only accounts are removed
+  only by an explicit `s3mm sync-accounts <replication> --apply --prune`.
+- MinIO `/list-users` response bodies are encrypted by madmin. `s3mm` uses
+  `export-iam` for both MinIO and RustFS; if `export-iam` is unavailable, a
+  plaintext `list-users` response from an older server is still accepted.
 
 ## Requirements
 

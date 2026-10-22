@@ -16,6 +16,38 @@ namespace {
 
 int64_t nowSec() { return (int64_t)tm::toSeconds(tm::now()); }
 
+void hashField(std::string& out, const std::string& value) {
+    out += std::to_string(value.size());
+    out += ':';
+    out += value;
+    out += '\n';
+}
+
+std::string metadataFingerprint(const s3::ObjectMeta& meta) {
+    std::string canonical;
+    hashField(canonical, meta.contentType);
+    hashField(canonical, meta.contentEncoding);
+    hashField(canonical, meta.contentLanguage);
+    hashField(canonical, meta.contentDisposition);
+    hashField(canonical, meta.cacheControl);
+    hashField(canonical, meta.expires);
+    hashField(canonical, meta.storageClass);
+    for (const auto& [k, v] : meta.userMeta) {
+        hashField(canonical, k);
+        hashField(canonical, v);
+    }
+    return crypto::sha256Hex(canonical);
+}
+
+std::string tagsFingerprint(const std::map<std::string, std::string>& tags) {
+    std::string canonical;
+    for (const auto& [k, v] : tags) {
+        hashField(canonical, k);
+        hashField(canonical, v);
+    }
+    return crypto::sha256Hex(canonical);
+}
+
 int64_t elapsed(int64_t sinceSec) {
     int64_t n = nowSec();
     return n >= sinceSec ? n - sinceSec : 0;
@@ -330,6 +362,7 @@ Result<void> Engine::deliver(RepState& st, Candidate& candidate) {
     rec.account = candidate.account;
     rec.size = candidate.size;
     rec.etag = candidate.etag;
+    rec.versionId = candidate.versionId;
     rec.lastModified = candidate.lastModified;
     rec.contentType = candidate.contentType;
     rec.meta = candidate.meta;
@@ -346,7 +379,10 @@ Result<void> Engine::deliver(RepState& st, Candidate& candidate) {
             info.lastModified = candidate.lastModified;
             info.versionId = candidate.versionId;
             if (const registry::Replication* rep = registry_.replication(candidate.replication)) {
-                state_.bucket(candidate.replication, rep->source, candidate.bucket).markShipped(info);
+                auto& cache = state_.bucket(candidate.replication, rep->source, candidate.bucket);
+                cache.markShipped(info);
+                if (!candidate.metadataHash.empty())
+                    cache.noteMetadata(candidate.key, candidate.metadataHash, candidate.tagsHash, tm::now());
                 markDirty(candidate.replication, rep->source, candidate.bucket);
             }
             if (candidate.lastModified > tm::TimePoint{}) {
@@ -393,18 +429,28 @@ Result<void> Engine::propagateBucketSettings(RepState& st, const std::string& bu
         auto created = st.destination->createBucket(bucket, location);
         if (!created) return Result<void>(created.error());
     }
+    bool ok = true;
+    std::string firstError;
+    auto remember = [&](const std::string& what, const std::string& err) {
+        LOG_WARN("propagate ", what, " to ", bucket, ": ", err);
+        if (ok) firstError = what + ": " + err;
+        ok = false;
+    };
     if (!versioning.empty()) {
         auto res = st.destination->putBucketVersioning(bucket, versioning);
-        if (!res) LOG_WARN("propagate versioning to ", bucket, ": ", res.error());
+        if (!res) remember("versioning", res.error());
     }
-    if (!tags.tags.empty()) {
-        auto res = st.destination->putBucketTagging(bucket, tags);
-        if (!res) LOG_WARN("propagate tagging to ", bucket, ": ", res.error());
-    }
+    // Always apply the full tag/policy state so removals also propagate.
+    auto tagRes = st.destination->putBucketTagging(bucket, tags);
+    if (!tagRes) remember("tagging", tagRes.error());
     if (!policyJson.empty()) {
         auto res = st.destination->putBucketPolicy(bucket, policyJson);
-        if (!res) LOG_WARN("propagate bucket policy to ", bucket, ": ", res.error());
+        if (!res) remember("bucket policy", res.error());
+    } else {
+        auto res = st.destination->deleteBucketPolicy(bucket);
+        if (!res) remember("bucket policy removal", res.error());
     }
+    if (!ok) return Result<void>::failure(firstError);
     state_.setBucketSettingsHash(rep.name, bucket, hash);
     auto saved = state_.persist();
     if (!saved) LOG_WARN("persist bucket settings hash: ", saved.error());
@@ -467,27 +513,25 @@ Result<void> Engine::scanBucket(RepState& st, const s3::BucketInfo& bucket) {
         if (tagging) tags = tagging.value().tags;
     }
 
-    // ---- listing (only when needed for the bucket decision or for the delta)
-    std::map<std::string, s3::ObjectInfo> current;
+    // ---- listing. Bucket decisions only need counts; the delta pass below
+    // streams objects page by page instead of materialising the whole bucket.
+    std::set<std::string> seen;
     uint64_t totalCount = 0, totalSize = 0;
-    bool listed = false;
-    auto listPass = [&]() -> Result<void> {
+    auto listCounts = [&]() -> Result<void> {
         std::string token;
         do {
             auto page = st.source->listObjects(bucket.name, {}, {}, token, 1000);
             if (!page) return Result<void>::failure(page.error());
             for (const auto& o : page.value().objects) {
-                current[o.key] = o;
                 totalCount++;
                 totalSize += o.size;
             }
             token = page.value().truncated ? page.value().nextToken : std::string();
         } while (!token.empty());
-        listed = true;
         return Result<void>::success();
     };
     if (needCounts) {
-        auto res = listPass();
+        auto res = listCounts();
         if (!res) return res;
     }
 
@@ -545,15 +589,98 @@ Result<void> Engine::scanBucket(RepState& st, const s3::BucketInfo& bucket) {
         if (!res) LOG_WARN("bucket ", bucket.name, ": propagate settings: ", res.error());
     }
 
-    if (!listed) {
-        auto res = listPass();
-        if (!res) return res;
-    }
+    // ---- object delta (streamed)
+    const bool needHead = mentionsRule(st.bundle, policy::Category::Object, "content-type") ||
+                          mentionsRule(st.bundle, policy::Category::Object, "chunk-count");
+    const bool needTags = mentionsRule(st.bundle, policy::Category::Object, "tags.");
+    const tm::TimePoint scanNow = tm::now();
+    std::string token;
+    do {
+        auto page = st.source->listObjects(bucket.name, {}, {}, token, 1000);
+        if (!page) return Result<void>::failure(page.error());
+        for (const auto& o : page.value().objects) {
+            const std::string& key = o.key;
+            seen.insert(key);
+            stat.objectsScanned++;
+
+            bool contentChanged = cache.changed(o);
+            std::string qk = bucket.name + "\x1f" + key;
+            {
+                std::lock_guard<std::mutex> lock(st.queueMutex);
+                if (st.queuedKeys.count(qk)) continue; // already waiting for shipment
+            }
+            bool due = contentChanged ||
+                       (rep.metadataEverySec > 0 && cache.metadataDue(key, scanNow, rep.metadataEverySec));
+            bool checkMeta = due || needHead || needTags;
+            if (!checkMeta) continue;
+
+            s3::ObjectMeta meta;
+            auto head = st.source->headObject(bucket.name, key);
+            if (head && head.value().exists) meta = head.value();
+            else if (!head) LOG_DEBUG("replication '", rep.name, "': cannot read metadata of ", bucket.name, "/", key,
+                                      ": ", head.error());
+            auto tagging = st.source->getObjectTagging(bucket.name, key);
+            if (tagging) meta.tags = tagging.value().tags;
+
+            std::string metaHash = metadataFingerprint(meta);
+            std::string tagHash = tagsFingerprint(meta.tags);
+            if (!contentChanged && !cache.metadataChanged(key, metaHash, tagHash)) {
+                cache.noteMetadata(key, metaHash, tagHash, scanNow);
+                continue;
+            }
+
+            stat.deltaDetected++;
+            stat.bytesDetected += o.size;
+
+            policy::Context octx = objectContext(bucket.name, key, o.size, o.etag, o.lastModified, o.storageClass,
+                                                 o.versionId, meta.contentType, meta.parts, meta.tags, false);
+            policy::Decision d = policyEngine_.evaluate(st.bundle, policy::Category::Object, octx, rep.name);
+
+            Candidate c = Candidate::fromDecision(d, o, rep.name, bucket.name);
+            c.versionId = o.versionId;
+            c.contentType = meta.contentType;
+            c.meta = d.transforms();
+            c.metadataHash = metaHash;
+            c.tagsHash = tagHash;
+
+            RouteInfo ri;
+            ri.atSec = nowSec();
+            ri.replication = rep.name;
+            ri.kind = "object";
+            ri.bucket = bucket.name;
+            ri.key = key;
+            ri.outcome = d.outcome;
+            ri.target = d.target;
+            ri.rule = c.rule;
+            ri.reason = c.reason;
+            ri.size = o.size;
+            record(std::move(ri));
+
+            if (d.outcome == "success") {
+                stat.accepted++;
+                std::lock_guard<std::mutex> lock(st.queueMutex);
+                if (st.queuedKeys.insert(qk).second) {
+                    if (st.queue.empty()) st.queueSinceSec = nowSec();
+                    st.queue.push_back(QueuedItem{std::move(c), nowSec()});
+                }
+            } else {
+                if (d.outcome == "denied") stat.denied++;
+                else stat.warned++;
+                auto res = deliver(st, c);
+                if (res) {
+                    // settled: do not re-evaluate until the source changes
+                    cache.observe(o);
+                    cache.noteMetadata(key, metaHash, tagHash, scanNow);
+                }
+            }
+        }
+        token = page.value().truncated ? page.value().nextToken : std::string();
+    } while (!token.empty());
 
     // ---- deletions observed on the source
     std::vector<std::string> gone;
     for (const auto& [key, entry] : cache.entries())
-        if (!entry.deleted && !current.count(key)) gone.push_back(key);
+        if (!entry.deleted && !seen.count(key)) gone.push_back(key);
     for (const auto& key : gone) {
         cache.markDeleted(key, tm::now());
         stat.deltaDetected++;
@@ -621,63 +748,6 @@ Result<void> Engine::scanBucket(RepState& st, const s3::BucketInfo& bucket) {
         }
     }
 
-    // ---- object delta
-    const bool needHead = mentionsRule(st.bundle, policy::Category::Object, "content-type") ||
-                          mentionsRule(st.bundle, policy::Category::Object, "chunk-count");
-    for (const auto& [key, o] : current) {
-        stat.objectsScanned++;
-        if (!cache.changed(o)) continue;
-
-        std::string qk = bucket.name + "\x1f" + key;
-        {
-            std::lock_guard<std::mutex> lock(st.queueMutex);
-            if (st.queuedKeys.count(qk)) continue; // already waiting for shipment
-        }
-        stat.deltaDetected++;
-        stat.bytesDetected += o.size;
-
-        s3::ObjectMeta meta;
-        if (needHead) {
-            auto head = st.source->headObject(bucket.name, key);
-            if (head) meta = head.value();
-        }
-        policy::Context octx = objectContext(bucket.name, key, o.size, o.etag, o.lastModified, o.storageClass,
-                                             o.versionId, meta.contentType, meta.parts, meta.userMeta, false);
-        policy::Decision d = policyEngine_.evaluate(st.bundle, policy::Category::Object, octx, rep.name);
-
-        Candidate c = Candidate::fromDecision(d, o, rep.name, bucket.name);
-        c.versionId = o.versionId;
-        c.contentType = meta.contentType;
-        c.meta = d.transforms();
-
-        RouteInfo ri;
-        ri.atSec = nowSec();
-        ri.replication = rep.name;
-        ri.kind = "object";
-        ri.bucket = bucket.name;
-        ri.key = key;
-        ri.outcome = d.outcome;
-        ri.target = d.target;
-        ri.rule = c.rule;
-        ri.reason = c.reason;
-        ri.size = o.size;
-        record(std::move(ri));
-
-        if (d.outcome == "success") {
-            stat.accepted++;
-            std::lock_guard<std::mutex> lock(st.queueMutex);
-            if (st.queuedKeys.insert(qk).second) {
-                if (st.queue.empty()) st.queueSinceSec = nowSec();
-                st.queue.push_back(QueuedItem{std::move(c), nowSec()});
-            }
-        } else {
-            if (d.outcome == "denied") stat.denied++;
-            else stat.warned++;
-            auto res = deliver(st, c);
-            if (res) cache.observe(o); // settled: do not re-evaluate until the source changes
-        }
-    }
-
     return Result<void>::success();
 }
 
@@ -691,12 +761,17 @@ Result<void> Engine::shipReady(RepState& st, bool force) {
         std::lock_guard<std::mutex> lock(st.queueMutex);
         if (st.queue.empty()) return Result<void>::success();
         uint64_t bytes = 0, qualifying = 0;
+        bool hasDeletes = false;
         for (const auto& item : st.queue) {
             bytes += item.candidate.size;
             if ((int64_t)item.candidate.size >= th.minSizeBytes) qualifying += item.candidate.size;
+            if (item.candidate.kind == Candidate::Kind::Delete) hasDeletes = true;
         }
         int64_t age = st.queue.empty() ? 0 : elapsed(st.queueSinceSec);
-        if (!force && !thresholdsReached(th, bytes, qualifying, age)) return Result<void>::success();
+        // Tombstones have size 0 and are already past the retention window when
+        // they enter the queue. Size/min-size thresholds would otherwise keep
+        // them pending forever (notably with --run-once).
+        if (!force && !hasDeletes && !thresholdsReached(th, bytes, qualifying, age)) return Result<void>::success();
         items = std::move(st.queue);
         st.queue.clear();
         st.queuedKeys.clear();
@@ -790,7 +865,10 @@ Result<void> Engine::scanReplication(RepState& st) {
         deliver(st, c);
         return false;
     };
-    auto sync = accounts_.sync(rep, false, rep.deletePropagation, accept);
+    // delete_propagation governs objects/buckets only. Removing accounts is an
+    // explicit, destructive operation (`sync-accounts --prune`), otherwise a
+    // narrow accounts filter would delete unrelated destination accounts.
+    auto sync = accounts_.sync(rep, false, false, accept);
     if (sync) {
         stat.accountsSynced += sync.value().created + sync.value().updated;
         if (!sync.value().empty())
@@ -816,6 +894,84 @@ Result<void> Engine::scanReplication(RepState& st) {
             LOG_WARN("replication '", rep.name, "': bucket ", bucket.name, ": ", res.error());
             stat.lastError = tm::now();
             stat.lastErrorText = res.error();
+        }
+    }
+
+    // ---- bucket deletions observed on the source
+    if (rep.deletePropagation) {
+        bool stateChanged = false;
+        std::set<std::string> current;
+        for (const auto& bucket : buckets.value()) {
+            if (!glob::matchFilter(rep.buckets, bucket.name)) continue;
+            current.insert(bucket.name);
+            if (state_.bucketDeleteSince(rep.name, rep.source, bucket.name) != tm::TimePoint{}) {
+                state_.clearBucketMissing(rep.name, rep.source, bucket.name);
+                stateChanged = true;
+            }
+        }
+        for (const auto& name : state_.knownBuckets(rep.name, rep.source)) {
+            if (current.count(name) || !glob::matchFilter(rep.buckets, name)) continue;
+            // Persist the first observation so a short source outage cannot
+            // delete a bucket immediately after a daemon restart.
+            if (state_.bucketDeleteSince(rep.name, rep.source, name) == tm::TimePoint{}) {
+                state_.markBucketMissing(rep.name, rep.source, name, tm::now());
+                stateChanged = true;
+            }
+            auto since = state_.bucketDeleteSince(rep.name, rep.source, name);
+            int64_t age = elapsed((int64_t)tm::toSeconds(since));
+            if (rep.retentionSec > 0 && age < rep.retentionSec) continue;
+            auto exists = st.destination->headBucket(name);
+            if (!exists) {
+                LOG_WARN("replication '", rep.name, "': bucket ", name, " deletion: ", exists.error());
+                continue;
+            }
+            if (!exists.value()) {
+                state_.forgetBucket(rep.name, rep.source, name);
+                stateChanged = true;
+                continue;
+            }
+            // Delete every version and delete marker, not only the current
+            // object. Otherwise DeleteBucket fails on a versioned destination.
+            bool ok = true;
+            auto versions = st.destination->forEachObjectVersion(name, [&](const s3::ObjectVersion& v) {
+                auto del = st.destination->deleteObject(name, v.key, v.versionId);
+                if (!del && v.versionId == "null") del = st.destination->deleteObject(name, v.key);
+                if (!del) {
+                    LOG_WARN("replication '", rep.name, "': cannot delete version ", name, "/", v.key,
+                             " (", v.versionId, "): ", del.error());
+                    return Result<void>::failure(del.error());
+                }
+                return Result<void>::success();
+            });
+            if (!versions) {
+                // Some gateways reject ListObjectVersions. Fall back to
+                // deleting current objects; versioned buckets may need a
+                // second scan if old versions remain.
+                LOG_WARN("replication '", rep.name, "': cannot list versions of deleted bucket ", name,
+                         ": ", versions.error(), "; falling back to current objects");
+                auto objects = st.destination->forEachObject(name, {}, [&](const s3::ObjectInfo& o) {
+                    auto del = st.destination->deleteObject(name, o.key);
+                    if (!del) {
+                        LOG_WARN("replication '", rep.name, "': cannot delete ", name, "/", o.key, ": ", del.error());
+                        return Result<void>::failure(del.error());
+                    }
+                    return Result<void>::success();
+                });
+                if (!objects) ok = false;
+            }
+            if (!ok) continue;
+            auto del = st.destination->deleteBucket(name);
+            if (!del) {
+                LOG_WARN("replication '", rep.name, "': cannot delete bucket ", name, ": ", del.error());
+                continue;
+            }
+            state_.forgetBucket(rep.name, rep.source, name);
+            stateChanged = true;
+            LOG_INFO("replication '", rep.name, "': propagated deletion of bucket ", name);
+        }
+        if (stateChanged) {
+            auto saved = state_.persist();
+            if (!saved) LOG_WARN("replication '", rep.name, "': persist bucket deletion state: ", saved.error());
         }
     }
     stat.scanCycles++;

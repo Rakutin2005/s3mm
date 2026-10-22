@@ -46,9 +46,13 @@ target. Built-in bundles: `drop-all`, `default`.
 A scheduler ticks every 500 ms: `scanDue` -> `scanQueued` (CAS) -> worker pool.
 `worker_count = 0` means one dedicated worker per policy. The first scan of a
 bucket is full; later scans are deltas (`ListObjects` + persistent TSV cache under
-`/var/cache/s3mm`). Thresholds (queue size/time, min size, max disk) decide when
-a batch ships. Delete propagation uses tombstones with retention. A circuit
-breaker trips per cluster; queue overflow produces a warning + log.
+`/var/cache/s3mm`). Listings are streamed page-by-page; the cache stores a
+fingerprint of HTTP/user metadata and tags and re-reads them every
+`metadata_every` seconds. Thresholds (queue size/time, min size, max disk) decide
+when a batch ships. Delete propagation uses tombstones with retention; deleted
+buckets are recorded in `buckets.deleted` and purged of every object version and
+delete marker before removal. A circuit breaker trips per cluster; queue
+overflow produces a warning + log.
 
 ## Secrets
 

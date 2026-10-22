@@ -15,7 +15,9 @@ add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 
 find_package(CURL REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_library(ARGON2_LIBRARY NAMES argon2 REQUIRED)
 find_package(Threads REQUIRED)
+find_package(ZLIB REQUIRED)
 
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
@@ -30,6 +32,7 @@ add_library(s3mm_core STATIC
   src/common/value.cpp
   src/common/secret.cpp
   src/common/crypto.cpp
+  src/common/zip.cpp
   src/config/config.cpp
   src/policy/lexer.cpp
   src/policy/expr.cpp
@@ -41,6 +44,7 @@ add_library(s3mm_core STATIC
   src/s3/xml.cpp
   src/s3/client.cpp
   src/module/loader.cpp
+  src/module/iam_export.cpp
   src/registry/registry.cpp
   src/registry/mutate.cpp
   src/replication/cache.cpp
@@ -51,7 +55,7 @@ add_library(s3mm_core STATIC
   src/replication/engine.cpp
 )
 target_link_libraries(s3mm_core PUBLIC
-  CURL::libcurl OpenSSL::SSL OpenSSL::Crypto Threads::Threads ${CMAKE_DL_LIBS})
+  CURL::libcurl OpenSSL::SSL OpenSSL::Crypto Threads::Threads ZLIB::ZLIB ${CMAKE_DL_LIBS})
 target_compile_definitions(s3mm_core PUBLIC S3MM_VERSION="${PROJECT_VERSION}")
 
 # --------------------------------------------------------------------- daemon
@@ -82,6 +86,7 @@ function(s3mm_module name)
 endfunction()
 
 s3mm_module(minio modules/minio/mod_minio.cpp)
+target_link_libraries(s3mm_mod_minio PRIVATE ${ARGON2_LIBRARY})
 s3mm_module(aws    modules/aws/mod_aws.cpp)
 s3mm_module(ceph   modules/ceph/mod_ceph.cpp)
 s3mm_module(rustfs modules/rustfs/mod_rustfs.cpp)
@@ -103,6 +108,7 @@ add_executable(s3mm_tests
   tests/unit/test_sigv4.cpp
   tests/unit/test_xml.cpp
   tests/unit/test_cache.cpp
+  tests/unit/test_zip.cpp
   tests/unit/test_template.cpp
   tests/unit/test_target.cpp
   tests/unit/test_secrets.cpp

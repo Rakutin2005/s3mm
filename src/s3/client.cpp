@@ -13,6 +13,30 @@ namespace s3mm::s3 {
 
 static std::string isoOrEmpty(tm::TimePoint t) { return t.time_since_epoch().count() == 0 ? std::string() : tm::toIso8601(t); }
 
+/// `k1=v1&k2=v2` for the x-amz-tagging header (values are URL encoded).
+static std::string taggingHeader(const std::map<std::string, std::string>& tags) {
+    std::string out;
+    for (const auto& [k, v] : tags) {
+        if (!out.empty()) out += '&';
+        out += http::urlEncode(k, true) + "=" + http::urlEncode(v, true);
+    }
+    return out;
+}
+
+static void appendObjectHeaders(std::vector<std::pair<std::string, std::string>>& headers,
+                                const ObjectMeta& meta) {
+    if (!meta.contentType.empty()) headers.emplace_back("Content-Type", meta.contentType);
+    if (!meta.contentEncoding.empty()) headers.emplace_back("Content-Encoding", meta.contentEncoding);
+    if (!meta.contentLanguage.empty()) headers.emplace_back("Content-Language", meta.contentLanguage);
+    if (!meta.contentDisposition.empty()) headers.emplace_back("Content-Disposition", meta.contentDisposition);
+    if (!meta.cacheControl.empty()) headers.emplace_back("Cache-Control", meta.cacheControl);
+    if (!meta.expires.empty()) headers.emplace_back("Expires", meta.expires);
+    if (!meta.storageClass.empty() && meta.storageClass != "STANDARD")
+        headers.emplace_back("x-amz-storage-class", meta.storageClass);
+    for (const auto& [k, v] : meta.userMeta) headers.emplace_back("x-amz-meta-" + k, v);
+    if (!meta.tags.empty()) headers.emplace_back("x-amz-tagging", taggingHeader(meta.tags));
+}
+
 Client::Client(ClientOptions options, sigv4::Credentials credentials)
     : options_(std::move(options)), creds_(std::move(credentials)) {
     endpoints_ = options_.endpoints;
@@ -34,10 +58,14 @@ void Client::throttle() {
     lastRequest_ = std::chrono::steady_clock::now();
 }
 
-std::string Client::bucketPath(const std::string& bucket) const { return "/" + bucket; }
+std::string Client::bucketPath(const std::string& bucket) const {
+    return "/" + http::urlEncode(bucket, true);
+}
 
 std::string Client::objectPath(const std::string& bucket, const std::string& key) const {
-    return "/" + bucket + "/" + key;
+    // Keys may contain spaces, non-ASCII bytes and other characters that curl
+    // would otherwise reject or send unencoded. Keep '/' as the separator.
+    return "/" + http::urlEncode(bucket, true) + "/" + http::urlEncode(key, false);
 }
 
 Client::Attempt Client::prepare(const std::string& method, const std::string& resourcePath,
@@ -327,16 +355,60 @@ Result<ObjectListPage> Client::listObjects(const std::string& bucket, const std:
     return Result<ObjectListPage>(std::move(page));
 }
 
-Result<std::vector<ObjectInfo>> Client::listAllObjects(const std::string& bucket, const std::string& prefix) {
-    std::vector<ObjectInfo> out;
+Result<void> Client::forEachObject(const std::string& bucket, const std::string& prefix,
+                                   const std::function<Result<void>(const ObjectInfo&)>& callback) {
     std::string token;
     do {
         auto page = listObjects(bucket, prefix, {}, token, 1000);
-        if (!page) return Result<std::vector<ObjectInfo>>::failure(page.error());
-        for (auto& o : page.value().objects) out.push_back(std::move(o));
+        if (!page) return Result<void>::failure(page.error());
+        for (const auto& o : page.value().objects) {
+            auto res = callback(o);
+            if (!res) return res;
+        }
         token = page.value().truncated ? page.value().nextToken : std::string();
     } while (!token.empty());
+    return Result<void>::success();
+}
+
+Result<std::vector<ObjectInfo>> Client::listAllObjects(const std::string& bucket, const std::string& prefix) {
+    std::vector<ObjectInfo> out;
+    auto res = forEachObject(bucket, prefix, [&out](const ObjectInfo& o) {
+        out.push_back(o);
+        return Result<void>::success();
+    });
+    if (!res) return Result<std::vector<ObjectInfo>>::failure(res.error());
     return Result<std::vector<ObjectInfo>>(std::move(out));
+}
+
+Result<void> Client::forEachObjectVersion(
+    const std::string& bucket, const std::function<Result<void>(const ObjectVersion&)>& callback) {
+    std::string keyMarker;
+    std::string versionMarker;
+    for (;;) {
+        std::map<std::string, std::string> query{{"versions", ""}, {"max-keys", "1000"}};
+        if (!keyMarker.empty()) query["key-marker"] = keyMarker;
+        if (!versionMarker.empty()) query["version-id-marker"] = versionMarker;
+        auto att = execute(prepare("GET", bucketPath(bucket), query, {}, {}, false, {}, {}));
+        const auto& r = att.response;
+        if (!r.ok()) return Result<void>::failure("ListObjectVersions: " + xmlError(r));
+        auto doc = xml::parse(r.body);
+        if (!doc) return Result<void>::failure("ListObjectVersions: cannot parse XML");
+        for (const auto& name : {"Version", "DeleteMarker"}) {
+            for (const auto* c : doc.value().childrenNamed(name)) {
+                ObjectVersion v;
+                v.key = c->childText("Key");
+                v.versionId = c->childText("VersionId");
+                v.deleteMarker = std::string(name) == "DeleteMarker";
+                auto res = callback(v);
+                if (!res) return res;
+            }
+        }
+        if (doc.value().childText("IsTruncated") != "true") break;
+        keyMarker = doc.value().childText("NextKeyMarker");
+        versionMarker = doc.value().childText("NextVersionIdMarker");
+        if (keyMarker.empty()) break;
+    }
+    return Result<void>::success();
 }
 
 Result<ObjectMeta> Client::headObject(const std::string& bucket, const std::string& key) {
@@ -349,6 +421,11 @@ Result<ObjectMeta> Client::headObject(const std::string& bucket, const std::stri
     meta.size = r.header("content-length").empty() ? 0 : std::strtoull(r.header("content-length").c_str(), nullptr, 10);
     meta.etag = r.header("etag");
     meta.contentType = r.header("content-type");
+    meta.contentEncoding = r.header("content-encoding");
+    meta.contentLanguage = r.header("content-language");
+    meta.contentDisposition = r.header("content-disposition");
+    meta.cacheControl = r.header("cache-control");
+    meta.expires = r.header("expires");
     meta.storageClass = r.header("x-amz-storage-class");
     meta.versionId = r.header("x-amz-version-id");
     if (!r.header("x-amz-mp-parts-count").empty()) meta.parts = std::atoi(r.header("x-amz-mp-parts-count").c_str());
@@ -360,6 +437,7 @@ Result<ObjectMeta> Client::headObject(const std::string& bucket, const std::stri
 
 Result<std::string> Client::getObjectRange(const std::string& bucket, const std::string& key, uint64_t offset,
                                             uint64_t length) {
+    if (length == 0) return Result<std::string>(std::string());
     std::string range = "bytes=" + std::to_string(offset) + "-" + std::to_string(offset + length - 1);
     auto att = execute(prepare("GET", objectPath(bucket, key), {}, {}, {}, false, range, {}));
     const auto& r = att.response;
@@ -367,23 +445,53 @@ Result<std::string> Client::getObjectRange(const std::string& bucket, const std:
     return Result<std::string>(r.body);
 }
 
+Result<BucketTagging> Client::getObjectTagging(const std::string& bucket, const std::string& key) {
+    auto att = execute(prepare("GET", objectPath(bucket, key), {{"tagging", ""}}, {}, {}, false, {}, {}));
+    if (att.response.status == 404) return Result<BucketTagging>(BucketTagging{});
+    if (!att.response.ok()) return Result<BucketTagging>::failure("GetObjectTagging: " + xmlError(att.response));
+    BucketTagging tagging;
+    auto doc = xml::parse(att.response.body);
+    if (doc) {
+        if (const xml::Element* set = doc.value().child("TagSet")) {
+            for (const auto* t : set->childrenNamed("Tag"))
+                tagging.tags[t->childText("Key")] = t->childText("Value");
+        }
+    }
+    return Result<BucketTagging>(std::move(tagging));
+}
+
+Result<void> Client::putObjectTagging(const std::string& bucket, const std::string& key,
+                                      const BucketTagging& tagging) {
+    std::string body = "<Tagging><TagSet>";
+    for (const auto& [k, v] : tagging.tags)
+        body += "<Tag>" + xml::tag("Key", k) + xml::tag("Value", v) + "</Tag>";
+    body += "</TagSet></Tagging>";
+    auto att = execute(prepare("PUT", objectPath(bucket, key), {{"tagging", ""}}, body, {}, false,
+                               {}, {{"Content-Type", "text/xml"}}));
+    if (!att.response.ok()) return Result<void>::failure("PutObjectTagging: " + xmlError(att.response));
+    return Result<void>::success();
+}
+
+Result<void> Client::deleteObjectTagging(const std::string& bucket, const std::string& key) {
+    auto att = execute(prepare("DELETE", objectPath(bucket, key), {{"tagging", ""}}, {}, {}, false, {}, {}));
+    if (!att.response.ok() && att.response.status != 404)
+        return Result<void>::failure("DeleteObjectTagging: " + xmlError(att.response));
+    return Result<void>::success();
+}
+
 Result<void> Client::putObject(const std::string& bucket, const std::string& key, const std::string& body,
-                               const std::string& contentType,
-                               const std::map<std::string, std::string>& userMeta) {
+                               const ObjectMeta& meta) {
     std::vector<std::pair<std::string, std::string>> headers;
-    if (!contentType.empty()) headers.emplace_back("Content-Type", contentType);
-    for (const auto& [k, v] : userMeta) headers.emplace_back("x-amz-meta-" + k, v);
+    appendObjectHeaders(headers, meta);
     auto att = execute(prepare("PUT", objectPath(bucket, key), {}, body, {}, false, {}, headers));
     if (!att.response.ok()) return Result<void>::failure("PutObject: " + xmlError(att.response));
     return Result<void>::success();
 }
 
 Result<void> Client::putObjectFromFile(const std::string& bucket, const std::string& key, const std::string& path,
-                                       const std::string& contentType,
-                                       const std::map<std::string, std::string>& userMeta) {
+                                       const ObjectMeta& meta) {
     std::vector<std::pair<std::string, std::string>> headers;
-    if (!contentType.empty()) headers.emplace_back("Content-Type", contentType);
-    for (const auto& [k, v] : userMeta) headers.emplace_back("x-amz-meta-" + k, v);
+    appendObjectHeaders(headers, meta);
     auto att = execute(prepare("PUT", objectPath(bucket, key), {}, "", path, true, {}, headers));
     if (!att.response.ok()) return Result<void>::failure("PutObject: " + xmlError(att.response));
     return Result<void>::success();
@@ -391,12 +499,10 @@ Result<void> Client::putObjectFromFile(const std::string& bucket, const std::str
 
 Result<std::string> Client::uploadMultipartFromFile(const std::string& bucket, const std::string& key,
                                                     const std::string& path, uint64_t partSize,
-                                                    const std::string& contentType,
-                                                    const std::map<std::string, std::string>& userMeta) {
+                                                    const ObjectMeta& meta) {
     if (partSize < 5 * 1024 * 1024) partSize = 5 * 1024 * 1024;
     std::vector<std::pair<std::string, std::string>> headers;
-    if (!contentType.empty()) headers.emplace_back("Content-Type", contentType);
-    for (const auto& [k, v] : userMeta) headers.emplace_back("x-amz-meta-" + k, v);
+    appendObjectHeaders(headers, meta);
 
     auto create = execute(prepare("POST", objectPath(bucket, key), {{"uploads", ""}}, {}, {}, false, {}, headers));
     if (!create.response.ok()) return Result<std::string>::failure("CreateMultipartUpload: " + xmlError(create.response));
@@ -445,16 +551,20 @@ Result<std::string> Client::uploadMultipartFromFile(const std::string& bucket, c
     return Result<std::string>(etag);
 }
 
-Result<void> Client::deleteObject(const std::string& bucket, const std::string& key) {
-    auto att = execute(prepare("DELETE", objectPath(bucket, key), {}, {}, {}, false, {}, {}));
+Result<void> Client::deleteObject(const std::string& bucket, const std::string& key,
+                                  const std::string& versionId) {
+    std::map<std::string, std::string> query;
+    if (!versionId.empty()) query["versionId"] = versionId;
+    auto att = execute(prepare("DELETE", objectPath(bucket, key), query, {}, {}, false, {}, {}));
     if (!att.response.ok()) return Result<void>::failure("DeleteObject: " + xmlError(att.response));
     return Result<void>::success();
 }
 
 Result<std::string> Client::copyObject(const std::string& fromBucket, const std::string& fromKey,
                                        const std::string& toBucket, const std::string& toKey) {
+    const std::string source = "/" + http::urlEncode(fromBucket, true) + "/" + http::urlEncode(fromKey, false);
     auto att = execute(prepare("PUT", objectPath(toBucket, toKey), {}, {}, {}, false, {},
-                               {{"x-amz-copy-source", "/" + fromBucket + "/" + fromKey}}));
+                               {{"x-amz-copy-source", source}}));
     if (!att.response.ok()) return Result<std::string>::failure("CopyObject: " + xmlError(att.response));
     auto doc = xml::parse(att.response.body);
     return Result<std::string>(doc ? doc.value().childText("ETag") : std::string());

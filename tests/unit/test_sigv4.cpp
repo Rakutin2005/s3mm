@@ -85,3 +85,28 @@ TEST(sigv4_session_token) {
     CHECK(req.headers.count("x-amz-security-token"));
     CHECK_EQ(req.headers["x-amz-security-token"], std::string("TOKEN123"));
 }
+
+TEST(sigv4_path_encoding_no_double_escape) {
+    sigv4::Credentials creds;
+    creds.accessKey = "AKIA";
+    creds.secretKey = "secret";
+    creds.region = "us-east-1";
+
+    http::Request req;
+    req.method = "GET";
+    req.url = "https://s3.example.com/bucket/dir/key%20with%20space.txt";
+    auto res = sigv4::signAt(req, creds, "s3", "20240101T000000Z");
+    CHECK(res.canonicalRequest.find("\n/bucket/dir/key%20with%20space.txt\n") != std::string::npos);
+
+    http::Request raw;
+    raw.method = "GET";
+    raw.url = "https://s3.example.com/bucket/dir/key with space.txt";
+    auto res2 = sigv4::signAt(raw, creds, "s3", "20240101T000000Z");
+    CHECK(res2.canonicalRequest.find("\n/bucket/dir/key%20with%20space.txt\n") != std::string::npos);
+
+    http::Request percent;
+    percent.method = "GET";
+    percent.url = "https://s3.example.com/bucket/100%25.txt";
+    auto res3 = sigv4::signAt(percent, creds, "s3", "20240101T000000Z");
+    CHECK(res3.canonicalRequest.find("\n/bucket/100%25.txt\n") != std::string::npos);
+}

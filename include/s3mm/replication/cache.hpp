@@ -1,5 +1,6 @@
 #pragma once
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -19,6 +20,9 @@ struct CacheEntry {
     bool deleted = false;      // tombstone observed on the source
     tm::TimePoint deletedAt;
     bool shipped = false;      // replicated to the destination at least once
+    tm::TimePoint checkedAt;   // last metadata/tag verification
+    std::string metadataHash;  // HEAD metadata canonical hash
+    std::string tagsHash;      // object tags canonical hash
 
     bool sameAs(const s3::ObjectInfo& o) const {
         return !deleted && size == o.size && etag == o.etag && lastModified == o.lastModified;
@@ -40,6 +44,13 @@ public:
     bool changed(const s3::ObjectInfo& o) const;
     /// True when a key known to the cache disappeared on the source.
     std::vector<CacheEntry> missingSince(const std::map<std::string, s3::ObjectInfo>& current) const;
+
+    /// True when metadata/tags of a cached object should be re-read.
+    bool metadataDue(const std::string& key, tm::TimePoint now, int64_t periodSec) const;
+    /// True when the freshly read hashes differ from the cached ones.
+    bool metadataChanged(const std::string& key, const std::string& metadataHash, const std::string& tagsHash) const;
+    void noteMetadata(const std::string& key, const std::string& metadataHash, const std::string& tagsHash,
+                      tm::TimePoint when);
 
     /// Record an observed source state without marking it as replicated.
     void observe(const s3::ObjectInfo& info);
@@ -67,6 +78,20 @@ public:
     std::string bucketSettingsHash(const std::string& replication, const std::string& bucket) const;
     void setBucketSettingsHash(const std::string& replication, const std::string& bucket, const std::string& hash);
 
+    /// Buckets that have persisted state for this replication/source. Used to
+    /// detect bucket deletions on the source after a daemon restart.
+    std::vector<std::string> knownBuckets(const std::string& replication, const std::string& source) const;
+    /// When a missing bucket was first observed (zero if it is not pending).
+    tm::TimePoint bucketDeleteSince(const std::string& replication, const std::string& source,
+                                    const std::string& bucket);
+    /// Remember that a bucket disappeared from the source. Returns true when
+    /// this is the first observation.
+    bool markBucketMissing(const std::string& replication, const std::string& source, const std::string& bucket,
+                           tm::TimePoint when);
+    void clearBucketMissing(const std::string& replication, const std::string& source, const std::string& bucket);
+    /// Drop the cache/settings state of one bucket (after propagating its deletion).
+    void forgetBucket(const std::string& replication, const std::string& source, const std::string& bucket);
+
     /// Persist every loaded cache + settings hashes.
     Result<void> persist();
     /// Drop state of a replication (used by `rescan`).
@@ -76,9 +101,13 @@ private:
     std::string root_;
     std::map<std::string, BucketCache> caches_;
     std::map<std::string, std::string> settingsHashes_;
+    std::map<std::string, tm::TimePoint> bucketDeletes_;
+    std::set<std::string> loadedBucketDeletes_;
 
     std::string cachePath(const std::string& replication, const std::string& source, const std::string& bucket) const;
     std::string settingsPath(const std::string& replication) const;
+    std::string bucketDeletesPath(const std::string& replication, const std::string& source) const;
+    void loadBucketDeletes(const std::string& replication, const std::string& source);
 };
 
 } // namespace s3mm::repl

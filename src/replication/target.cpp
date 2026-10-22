@@ -225,33 +225,43 @@ Result<void> S3Target::ship(const ShipRecord& r, const std::string& dataPath) {
     if (r.kind == "delete") {
         auto head = destination_->headObject(destBucket, destKey);
         if (head && !head.value().exists) return Result<void>::success(); // already gone
+        // Do not pass the source versionId: version IDs are cluster-local. An
+        // unversioned DELETE mirrors a source delete marker on a versioned
+        // destination (or removes the object on an unversioned one).
         auto del = destination_->deleteObject(destBucket, destKey);
         if (!del) return Result<void>(del.error());
         LOG_INFO("s3 target '", name_, "': deleted ", destBucket, "/", destKey);
         return Result<void>::success();
     }
 
+    if (!source_) return Result<void>::failure("s3 target '" + name_ + "': no source client for object copy");
+
+    // Fetch source metadata/tags once. They are not part of the object body and
+    // were previously dropped during replication.
+    auto sourceHead = source_->headObject(r.bucket, r.key);
+    if (!sourceHead) return Result<void>(sourceHead.error());
+    if (!sourceHead.value().exists)
+        return Result<void>::failure("source object disappeared: " + r.bucket + "/" + r.key);
+    s3::ObjectMeta sourceMeta = sourceHead.value();
+    if (sourceMeta.contentType.empty()) sourceMeta.contentType = r.contentType;
+    auto tagging = source_->getObjectTagging(r.bucket, r.key);
+    if (tagging) sourceMeta.tags = tagging.value().tags;
+
     if (!dataPath.empty()) {
         auto meta = destination_->headObject(destBucket, destKey);
-        if (meta && meta.value().size > r.size) {
-            // skip when the destination copy is already newer/larger (delta friendly)
-            return Result<void>::success();
-        }
-        auto put = destination_->putObjectFromFile(destBucket, destKey, dataPath, r.contentType);
+        if (meta && meta.value().exists && meta.value().size == r.size && !r.etag.empty() &&
+            meta.value().etag == r.etag)
+            return Result<void>::success(); // identical copy already present
+        auto put = destination_->putObjectFromFile(destBucket, destKey, dataPath, sourceMeta);
         if (!put) return Result<void>(put.error());
         return Result<void>::success();
     }
 
-    if (!source_) return Result<void>::failure("s3 target '" + name_ + "': no source client for streaming copy");
-    auto meta = source_->headObject(r.bucket, r.key);
-    if (!meta) return Result<void>(meta.error());
-    if (!meta.value().exists) return Result<void>::failure("source object disappeared: " + r.bucket + "/" + r.key);
-
     const uint64_t maxInMemory = 8ull * 1024 * 1024;
-    if (meta.value().size <= maxInMemory) {
-        auto body = source_->getObjectRange(r.bucket, r.key, 0, meta.value().size);
+    if (sourceMeta.size <= maxInMemory) {
+        auto body = source_->getObjectRange(r.bucket, r.key, 0, sourceMeta.size);
         if (!body) return Result<void>(body.error());
-        auto put = destination_->putObject(destBucket, destKey, body.value(), meta.value().contentType);
+        auto put = destination_->putObject(destBucket, destKey, body.value(), sourceMeta);
         if (!put) return Result<void>(put.error());
         return Result<void>::success();
     }
@@ -263,8 +273,8 @@ Result<void> S3Target::ship(const ShipRecord& r, const std::string& dataPath) {
     std::FILE* f = std::fopen(staging.c_str(), "wb");
     if (!f) return Result<void>::failure("cannot create staging file " + staging);
     const uint64_t chunk = 16ull * 1024 * 1024;
-    while (offset < meta.value().size) {
-        uint64_t len = std::min(chunk, meta.value().size - offset);
+    while (offset < sourceMeta.size) {
+        uint64_t len = std::min(chunk, sourceMeta.size - offset);
         auto part = source_->getObjectRange(r.bucket, r.key, offset, len);
         if (!part) {
             std::fclose(f);
@@ -278,11 +288,11 @@ Result<void> S3Target::ship(const ShipRecord& r, const std::string& dataPath) {
     std::fclose(f);
 
     Result<void> upload = Result<void>::failure("not attempted");
-    if (meta.value().size <= 64ull * 1024 * 1024) {
-        upload = destination_->putObjectFromFile(destBucket, destKey, staging, meta.value().contentType);
+    if (sourceMeta.size <= 64ull * 1024 * 1024) {
+        upload = destination_->putObjectFromFile(destBucket, destKey, staging, sourceMeta);
     } else {
         auto mp = destination_->uploadMultipartFromFile(destBucket, destKey, staging, 16ull * 1024 * 1024,
-                                                       meta.value().contentType);
+                                                       sourceMeta);
         upload = mp ? Result<void>::success() : Result<void>::failure(mp.error());
     }
     ::unlink(staging.c_str());

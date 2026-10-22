@@ -33,7 +33,9 @@ Exit codes: `0` success, `1` error, `2` usage error.
   `replication queue|route [name]`, `replication scan|flush [name]`
 - `stat [replica]`, `queues [replica]`, `routes [replica] [--limit N]`
 - `scan [replica] [--async|--force]`, `flush [replica]`
-- `sync-accounts <replication> [--apply] [--prune]` (dry-run unless `--apply`)
+- `sync-accounts <replication> [--apply] [--prune]` (dry-run unless `--apply`).
+  Without `--prune` accounts are only created/updated; `--prune` also removes
+  destination-only accounts. Scheduled replication account sync never prunes.
 - `rescan [replica]`, `reset-stats [replica]`, `reload`
 - `validate`, `flush-config`
 

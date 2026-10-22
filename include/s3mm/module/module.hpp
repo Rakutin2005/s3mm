@@ -18,6 +18,8 @@ struct FeatureSet {
     bool tagging = true;
     bool inventory = false;    // S3 Inventory based delta detection
     bool iamPolicy = true;     // attaching inline/managed policies to accounts
+    bool policyDetach = false; // removing managed policies from accounts
+    bool groups = false;       // group membership administration
 };
 
 /// One S3 account/user as seen by the admin API.
@@ -51,6 +53,19 @@ public:
                                          const std::string& permissions) = 0;
     virtual Result<void> removeBucketAccess(const std::string& accessKey, const std::string& bucket) = 0;
     virtual Result<void> attachPolicy(const std::string& accessKey, const std::string& policyName) = 0;
+    virtual Result<void> detachPolicy(const std::string& accessKey, const std::string& policyName) {
+        (void)accessKey;
+        (void)policyName;
+        return Result<void>::failure("policy detach is not supported by this module");
+    }
+    /// Make `accessKey` a member of exactly `desired` groups.
+    virtual Result<void> setGroups(const std::string& accessKey, const std::vector<std::string>& desired,
+                                   const std::vector<std::string>& current) {
+        (void)accessKey;
+        (void)desired;
+        (void)current;
+        return Result<void>::failure("group membership is not supported by this module");
+    }
     virtual Result<void> deleteAccount(const std::string& accessKey) = 0;
 };
 

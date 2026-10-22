@@ -465,6 +465,7 @@ Examples:
 // ------------------------------------------------------------------- run ----
 
 int runCommand(const Options& opts, const std::vector<std::string>& args) {
+    if (opts.test) return runValidate(opts);
     if (args.empty()) throw UsageError("no command given; try 's3mm --help'");
     const std::string cmd = args[0];
     const std::vector<std::string> rest(args.begin() + 1, args.end());
@@ -473,7 +474,7 @@ int runCommand(const Options& opts, const std::vector<std::string>& args) {
         std::cout << usage();
         return 0;
     }
-    if (opts.test || cmd == "validate") return runValidate(opts);
+    if (cmd == "validate") return runValidate(opts);
 
     // Build the request first: usage errors must not touch the socket.
     Value req = buildRequest(cmd, rest);

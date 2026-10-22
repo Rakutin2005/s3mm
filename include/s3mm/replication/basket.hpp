@@ -30,7 +30,9 @@ struct Candidate {
     std::string rule;     // matched rule name/number, "default" when applicable
     std::string reason;
     std::string versionId; // source version (empty for unversioned buckets)
-    int attempts = 0;      // delivery attempts (bounded by settings.retries)
+    std::string metadataHash; // canonical hash of HTTP/user metadata
+    std::string tagsHash;     // canonical hash of object tags
+    int attempts = 0;         // delivery attempts (bounded by settings.retries)
 
     static Candidate fromDecision(const policy::Decision& decision, const s3::ObjectInfo& info,
                                   const std::string& replication, const std::string& bucket);

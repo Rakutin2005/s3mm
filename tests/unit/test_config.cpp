@@ -126,3 +126,19 @@ TEST(config_dump_roundtrip) {
     CHECK_EQ(cfg2.value().s3mm()->value("socket"), std::string("/tmp/x.sock"));
     CHECK_EQ(cfg2.value().s3mm()->int64Value("worker_count", 0), 2);
 }
+
+TEST(config_top_level_block_rejected) {
+    const char* text = R"(
+cluster outside { addr http://x; }
+s3mm {
+    socket /tmp/s.sock;
+}
+)";
+    auto cfg = config::Config::parse(text);
+    CHECK(cfg);
+    auto errs = cfg.value().validate();
+    CHECK(!errs.empty());
+    bool found = false;
+    for (const auto& e : errs) found = found || e.find("outside") != std::string::npos;
+    CHECK(found);
+}

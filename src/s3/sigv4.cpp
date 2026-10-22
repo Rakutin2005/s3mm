@@ -1,6 +1,7 @@
 #include "s3mm/s3/sigv4.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <ctime>
 #include <map>
@@ -15,11 +16,37 @@ static std::string binaryHmac(const std::string& key, const std::string& data) {
     return std::string(reinterpret_cast<const char*>(d.data()), d.size());
 }
 
+static bool hexDigit(char c) { return std::isxdigit((unsigned char)c) != 0; }
+
+/// Canonicalise one path segment without double-encoding already escaped
+/// bytes. The wire path produced by s3::Client is encoded exactly once, while
+/// ad-hoc callers may still pass raw spaces/non-ASCII characters here.
+static std::string encodePathSegment(const std::string& s) {
+    static const char* hex = "0123456789ABCDEF";
+    std::string out;
+    for (size_t i = 0; i < s.size(); ++i) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '%' && i + 2 < s.size() && hexDigit(s[i + 1]) && hexDigit(s[i + 2])) {
+            out.append(s, i, 3);
+            i += 2;
+            continue;
+        }
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            out += (char)c;
+            continue;
+        }
+        out += '%';
+        out += hex[c >> 4];
+        out += hex[c & 0xF];
+    }
+    return out;
+}
+
 static std::string canonicalPath(const std::string& rawPath) {
     std::string path = rawPath.empty() ? "/" : rawPath;
     std::vector<std::string> segments = str::split(path, '/', false);
     std::vector<std::string> encoded;
-    for (const auto& s : segments) encoded.push_back(http::urlEncode(s, true));
+    for (const auto& s : segments) encoded.push_back(encodePathSegment(s));
     std::string out = "/" + str::join(encoded, "/");
     if (!path.empty() && path.back() == '/' && out.back() != '/') out += '/';
     return out;

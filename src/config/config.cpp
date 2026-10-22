@@ -66,6 +66,14 @@ bool Node::boolValue(const std::string& directive, bool fallback) const {
     throw ConfigError("directive '" + directive + "' expects on|off, got '" + v + "'", n->file, n->line);
 }
 
+bool Node::boolFlag(bool fallback) const {
+    if (args.empty()) return fallback;
+    const std::string& v = args[0];
+    if (v == "on" || v == "true" || v == "yes" || v == "1") return true;
+    if (v == "off" || v == "false" || v == "no" || v == "0") return false;
+    throw ConfigError("directive '" + name + "' expects on|off, got '" + v + "'", file, line);
+}
+
 int64_t Node::int64Value(const std::string& directive, int64_t fallback) const {
     const Node* n = find(directive);
     if (!n || n->args.empty()) return fallback;
@@ -303,6 +311,17 @@ static void checkUniqueNames(const Node& root, const std::string& kind, std::vec
 
 std::vector<std::string> Config::validate() const {
     std::vector<std::string> errors;
+    int s3mmBlocks = 0;
+    for (const auto& r : roots_) {
+        if (r.name == "s3mm") {
+            ++s3mmBlocks;
+            continue;
+        }
+        errors.push_back(r.file + ":" + std::to_string(r.line) + ": top-level '" + r.name +
+                         "' is outside the 's3mm { ... }' block and would be ignored");
+    }
+    if (s3mmBlocks > 1)
+        errors.push_back(path_ + ": multiple top-level 's3mm { ... }' blocks are not supported");
     if (!s3mm_) {
         errors.push_back(path_ + ": missing top-level 's3mm { ... }' block");
         return errors;

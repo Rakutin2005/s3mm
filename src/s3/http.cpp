@@ -173,7 +173,11 @@ Response Client::perform(const Request& request, void* curlFile) {
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
     }
-    if (!request.range.empty()) curl_easy_setopt(curl, CURLOPT_RANGE, request.range.c_str());
+    // CURLOPT_RANGE expects "start-end"; the S3 "bytes=" unit belongs to the
+    // wire header only and must not be passed to curl (curl adds it itself).
+    std::string range = request.range;
+    if (range.rfind("bytes=", 0) == 0) range.erase(0, std::strlen("bytes="));
+    if (!range.empty()) curl_easy_setopt(curl, CURLOPT_RANGE, range.c_str());
 
     ReadState readState;
     if (!request.bodyFile.empty()) {

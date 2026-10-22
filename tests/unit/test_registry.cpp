@@ -136,3 +136,36 @@ s3mm {
     CHECK_EQ(reg.value().bundle("default")->defaultAction(Category::Object).name, std::string("drop"));
     CHECK_EQ(reg.value().bundle("default")->rules.size(), 1u);
 }
+
+TEST(registry_boolean_flags_are_not_ignored) {
+    const char* text = R"(
+s3mm {
+    permanent on;
+    cluster src {
+        addr http://127.0.0.1:9000;
+        credential c;
+        path_style off;
+        insecure on;
+    }
+    cluster dst { addr http://127.0.0.1:9001; credential c; }
+    credential c { access_key AK; secret_key SK; read_only on; }
+    replication r {
+        source src; destination dst;
+        delete_propagation on;
+        paused on;
+    }
+}
+)";
+    auto cfg = config::Config::parse(text);
+    CHECK(cfg);
+    auto reg = registry::Registry::fromConfig(cfg.value());
+    CHECK(reg);
+    if (!reg) return;
+    CHECK(reg.value().settings().permanent);
+    CHECK(reg.value().cluster("src") != nullptr);
+    CHECK(!reg.value().cluster("src")->pathStyle);
+    CHECK(reg.value().cluster("src")->insecure);
+    CHECK(reg.value().credentials().front().readOnly);
+    CHECK(reg.value().replications().front().deletePropagation);
+    CHECK(reg.value().replications().front().paused);
+}
