@@ -8,6 +8,7 @@
 #include "s3mm/common/log.hpp"
 #include "s3mm/config/config.hpp"
 #include "s3mm/registry/registry.hpp"
+#include "s3mm/rest/rbac.hpp"
 
 namespace s3mm::rest {
 
@@ -61,6 +62,18 @@ void RestDaemon::registerDefaults() {
             res.status = 502;
             res.json(Value::object().set("error", Value::str(e.what())));
         }
+    });
+    router_.add("GET", "/rbac/users", [](const RestRequest&, RestResponse& res) {
+        res.status = 501;
+        res.json(Value::object().set("error", Value::str("RBAC is not implemented yet")));
+    });
+    router_.add("GET", "/rbac/roles", [](const RestRequest&, RestResponse& res) {
+        res.status = 501;
+        res.json(Value::object().set("error", Value::str("RBAC is not implemented yet")));
+    });
+    router_.add("GET", "/rbac/permissions", [](const RestRequest&, RestResponse& res) {
+        res.status = 501;
+        res.json(Value::object().set("error", Value::str("RBAC is not implemented yet")));
     });
     router_.add("GET", "/replications", [this](const RestRequest&, RestResponse& res) {
         Value req = Value::object();

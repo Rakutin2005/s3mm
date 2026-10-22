@@ -107,7 +107,10 @@ void HttpServer::acceptOne(const Handler& handler) {
         }
     }
 
-    if (req.method.empty()) {
+    if (req.method == "OPTIONS") {
+        res.status = 204;
+        res.body.clear();
+    } else if (req.method.empty()) {
         res.status = 400;
         res.text("bad request");
     } else {
@@ -118,6 +121,9 @@ void HttpServer::acceptOne(const Handler& handler) {
     out << "HTTP/1.1 " << res.status << " " << (res.status == 200 ? "OK" : "ERROR") << "\r\n";
     if (res.headers.find("Content-Type") == res.headers.end()) res.headers["Content-Type"] = "application/json";
     for (const auto& [k, v] : res.headers) out << k << ": " << v << "\r\n";
+    out << "Access-Control-Allow-Origin: *\r\n";
+    out << "Access-Control-Allow-Headers: Content-Type, Authorization\r\n";
+    out << "Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\n";
     out << "Content-Length: " << res.body.size() << "\r\n";
     out << "Connection: close\r\n\r\n";
     out << res.body;
