@@ -30,6 +30,18 @@ logs exclusively to syslog (RFC 5424), runs under systemd, and keeps all state u
 - Firewall-style CLI (`s3mm`) with one-shot and `--permanent` mutations,
   `flush-config`, `-t` validation, table/json/yaml output.
 
+## REST interface (s3mmws)
+
+`s3mmws` is a separate daemon that exposes the main daemon over HTTP REST. It talks to
+`s3mmd` through its UNIX control socket and loads REST-only modules (`.so`) that may
+change authentication, request processing and add endpoints. It has no GUI.
+
+```text
+s3mmws -c /etc/s3mm/s3mm.conf -l 127.0.0.1 -p 8080
+```
+
+Endpoints: `/health`, `/status`, `/modules`, `/replications`, `/rpc` (POST JSON command).
+
 ## Replication semantics
 
 ```text

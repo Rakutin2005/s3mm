@@ -76,6 +76,17 @@ add_executable(s3mm
 )
 target_link_libraries(s3mm PRIVATE s3mm_core)
 
+# --------------------------------------------------------------- rest daemon
+add_executable(s3mmws
+  src/rest/main.cpp
+  src/rest/daemon.cpp
+  src/rest/server.cpp
+  src/rest/router.cpp
+  src/rest/loader.cpp
+  src/cli/client.cpp
+)
+target_link_libraries(s3mmws PRIVATE s3mm_core)
+
 # -------------------------------------------------------------------- modules
 function(s3mm_module name)
   add_library(s3mm_mod_${name} MODULE ${ARGN})
@@ -125,5 +136,5 @@ target_link_libraries(s3mm_e2e PRIVATE s3mm_core)
 add_test(NAME e2e COMMAND s3mm_e2e)
 
 # ------------------------------------------------------------------- install
-install(TARGETS s3mmd s3mm RUNTIME DESTINATION bin)
+install(TARGETS s3mmd s3mm s3mmws RUNTIME DESTINATION bin)
 install(DIRECTORY ${CMAKE_BINARY_DIR}/modules/ DESTINATION lib/s3mm/modules FILES_MATCHING PATTERN "*.so")
