@@ -153,6 +153,7 @@ Value clusterValue(const Cluster& c) {
     v.set("part_size", Value::number(c.partSize));
     v.set("retries", Value::number((int64_t)c.retries));
     v.set("description", Value::str(c.description));
+    v.set("managed", c.managed ? Value::boolean(true) : Value::boolean(false));
     return v;
 }
 
@@ -349,6 +350,7 @@ Value mutateEntity(Registry& r, const std::string& cmd, const std::string& kindR
         if (has(fields, "part_size")) c.partSize = fsize(fields, "part_size", c.partSize);
         if (has(fields, "retries")) c.retries = (int)fint(fields, "retries", c.retries);
         if (has(fields, "description")) c.description = fstr(fields, "description", c.description);
+        if (has(fields, "managed")) c.managed = fbool(fields, "managed", c.managed);
         Result<void> res = isAdd ? r.addCluster(c) : r.updateCluster(name, c);
         if (!res) throw Error(res.error());
         return clusterValue(c);

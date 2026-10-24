@@ -75,7 +75,7 @@ Result<void> Registry::parseSettings(const Node& node) {
                 settings_.scanEverySec = units::parseDurationSeconds(c.value("every", "5m"));
                 settings_.bucketScanEverySec = units::parseDurationSeconds(c.value("bucket_every", "0"));
             } else if (c.name == "include" || c.name == "cluster" || c.name == "credential" || c.name == "policy" ||
-                       c.name == "replication" || c.name == "target") {
+                       c.name == "replication" || c.name == "target" || c.name == "s3mmws") {
                 continue; // handled elsewhere
             } else {
                 return Result<void>::failure(loc(c) + ": unknown directive '" + c.name + "' in s3mm block");
@@ -116,6 +116,7 @@ Result<void> Registry::parseCluster(const Node& node) {
             else if (d.name == "part_size") c.partSize = units::parseSize(d.argOr(0, "16M"));
             else if (d.name == "retries") c.retries = (int)d.int64Value("retries", 5);
             else if (d.name == "description") c.description = d.argOr(0);
+            else if (d.name == "managed") c.managed = d.boolFlag(true);
             else return Result<void>::failure(loc(d) + ": unknown directive '" + d.name + "' in cluster '" + c.name + "'");
         } catch (const Error& e) {
             return Result<void>::failure(loc(d) + ": " + e.what());

@@ -26,6 +26,7 @@ struct Cluster {
     uint64_t partSize = 16ull * 1024 * 1024;
     int retries = 5;
     std::string description;
+    bool managed = true;                 // managed cluster with plugin/management API access
 };
 
 struct Credential {

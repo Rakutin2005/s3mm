@@ -83,9 +83,11 @@ add_executable(s3mmws
   src/rest/server.cpp
   src/rest/router.cpp
   src/rest/loader.cpp
+  src/rest/auth.cpp
+  src/rest/rbac_store.cpp
   src/cli/client.cpp
 )
-target_link_libraries(s3mmws PRIVATE s3mm_core)
+target_link_libraries(s3mmws PRIVATE s3mm_core ${ARGON2_LIBRARY} ldap lber)
 
 # -------------------------------------------------------------------- modules
 function(s3mm_module name)
