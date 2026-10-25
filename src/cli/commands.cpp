@@ -138,6 +138,7 @@ Value simpleRequest(const std::string& cmd, const std::vector<std::string>& rest
 
 Value buildRequest(const std::string& cmd, const std::vector<std::string>& rest) {
     // ---- aliases that expand to base commands -----------------------------
+
     if (cmd == "replication") {
         if (rest.empty())
             throw UsageError(
@@ -205,6 +206,19 @@ Value buildRequest(const std::string& cmd, const std::vector<std::string>& rest)
         req.set("replication", Value::str(a.positional[0]));
         req.set("dry_run", Value::boolean(!optFlag(a, "apply")));
         if (optFlag(a, "prune")) req.set("prune", Value::boolean(true));
+        return req;
+    }
+
+    if (cmd == "peer") {
+        Args a = parseArgs(rest, false);
+        std::string action = a.positional.empty() ? "list" : a.positional[0];
+        Value req = Value::object();
+        req.set("cmd", Value::str(cmd));
+        req.set("action", Value::str(action));
+        if (action == "add" || action == "remove") {
+            if (a.positional.size() < 2) throw UsageError("peer " + action + ": address required");
+            req.set("address", Value::str(a.positional[1]));
+        }
         return req;
     }
 

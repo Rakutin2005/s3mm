@@ -62,6 +62,7 @@ target_compile_definitions(s3mm_core PUBLIC S3MM_VERSION="${PROJECT_VERSION}")
 add_executable(s3mmd
   src/daemon/daemon.cpp
   src/daemon/server.cpp
+  src/daemon/peerserver.cpp
   src/daemon/metrics.cpp
   src/daemon/main.cpp
 )
@@ -85,6 +86,7 @@ add_executable(s3mmws
   src/rest/loader.cpp
   src/rest/auth.cpp
   src/rest/rbac_store.cpp
+  src/rest/cluster.cpp
   src/cli/client.cpp
 )
 target_link_libraries(s3mmws PRIVATE s3mm_core ${ARGON2_LIBRARY} ldap lber)

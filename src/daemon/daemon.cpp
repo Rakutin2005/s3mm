@@ -201,6 +201,25 @@ Result<void> Daemon::loadConfig() {
     registry_ = std::make_unique<registry::Registry>(std::move(registry.value()));
     loadedConfigPath_ = cfg.value().path();
 
+    // peer (mTLS) settings from config
+    if (const auto* s3mm = cfg.value().s3mm()) {
+        if (const auto* peers = s3mm->find("peers")) {
+            if (peers->block) {
+                options_.peerPort = (int)peers->int64Value("listen", 0);
+                options_.peerBind = peers->value("bind", options_.peerBind);
+                options_.peerCert = peers->value("cert", options_.peerCert);
+                options_.peerKey = peers->value("key", options_.peerKey);
+                options_.peerCa = peers->value("ca", options_.peerCa);
+            }
+        }
+        // peer <address> { ... } blocks
+        for (const auto& c : s3mm->children) {
+            if (c.name == "peer" && c.block) {
+                if (c.hasArg(0)) options_.peers.push_back(c.arg(0));
+            }
+        }
+    }
+
     // modules (fresh dlopen handles on every (re)load)
     loader_ = std::make_unique<module::Loader>();
     const auto& settings = registry_->settings();
@@ -276,8 +295,48 @@ void Daemon::installSignals() {
     ::signal(SIGPIPE, SIG_IGN);
 }
 
+// peer inventory fetch (minimal)
+namespace {
+std::string peerFetchInventory(const std::string& address, const std::string& certFile, const std::string& keyFile, const std::string& caFile) {
+    // address: host:port
+    std::string host = address;
+    int port = 9443;
+    size_t colon = address.find(':');
+    if (colon != std::string::npos) { host = address.substr(0, colon); port = std::stoi(address.substr(colon+1)); }
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return "";
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) { ::close(fd); return ""; }
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) { ::close(fd); return ""; }
+    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+    if (!certFile.empty()) SSL_CTX_use_certificate_file(ctx, certFile.c_str(), SSL_FILETYPE_PEM);
+    if (!keyFile.empty()) SSL_CTX_use_PrivateKey_file(ctx, keyFile.c_str(), SSL_FILETYPE_PEM);
+    if (!caFile.empty()) SSL_CTX_load_verify_locations(ctx, caFile.c_str(), nullptr);
+    SSL* ssl = SSL_new(ctx);
+    SSL_set_fd(ssl, fd);
+    if (SSL_connect(ssl) <= 0) { SSL_free(ssl); SSL_CTX_free(ctx); ::close(fd); return ""; }
+    std::string req = "{\"cmd\":\"inventory\"}\n";
+    SSL_write(ssl, req.c_str(), req.size());
+    std::string resp;
+    char buf[4096];
+    for (;;) {
+        int n = SSL_read(ssl, buf, sizeof(buf));
+        if (n <= 0) break;
+        resp.append(buf, n);
+        if (resp.find('\n') != std::string::npos) break;
+    }
+    SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); ::close(fd);
+    return resp;
+}
+}
+
 Result<void> Daemon::startServers() {
     const std::string& socket = options_.socket.empty() ? registry_->settings().socket : options_.socket;
+    if (socket.find("://") != std::string::npos || (socket.find(':') != std::string::npos && socket.find('/') == std::string::npos)) {
+        return Result<void>::failure("s3mmd control socket must be a Unix domain socket path, not a network address");
+    }
     auto listened = gControl.listen(socket);
     if (!listened) return listened;
     LOG_INFO("control socket on ", socket);
@@ -288,12 +347,47 @@ Result<void> Daemon::startServers() {
         if (!bound) LOG_WARN("metrics: ", bound.error());
         else LOG_INFO("metrics on http://", metricsAddr, "/metrics");
     }
+
+    if (options_.peerPort > 0) {
+        peerServer_.setHandler([this](const std::string& req) -> std::string {
+            // parse cmd
+            std::string cmd;
+            // simple find
+            auto pos = req.find("\"cmd\"");
+            if (pos != std::string::npos) {
+                auto q1 = req.find('"', pos+6);
+                auto q2 = req.find('"', q1+1);
+                if (q1 != std::string::npos && q2 != std::string::npos) cmd = req.substr(q1+1, q2-q1-1);
+            }
+            if (cmd == "inventory") {
+                std::string out = "{\"clusters\":[";
+                bool first = true;
+                for (auto& c : registry_->clusters()) {
+                    if (!first) out += ",";
+                    first = false;
+                    out += "{\"name\":\"" + c.name + "\",\"vendor\":\"" + c.vendor + "\"}";
+                }
+                out += "]}";
+                return out + "\n";
+            }
+            return "{\"ok\":true,\"peer\":\"s3mmd\"}\n";
+        });
+        auto pl = peerServer_.listen(options_.peerBind, options_.peerPort, options_.peerCert, options_.peerKey, options_.peerCa);
+        if (!pl) LOG_WARN("peer server: ", pl.error());
+        else LOG_INFO("peer (mTLS) server on ", options_.peerBind, ":", options_.peerPort);
+    }
+    // fetch inventory from configured peers
+    for (auto& pa : options_.peers) {
+        std::string resp = peerFetchInventory(pa, options_.peerCert, options_.peerKey, options_.peerCa);
+        LOG_INFO("peer ", pa, " inventory: ", resp);
+    }
     return Result<void>::success();
 }
 
 void Daemon::stopServers() {
     gControl.close();
     gMetrics.close();
+    peerServer_.close();
     if (signalFd_ >= 0) {
         ::close(signalFd_);
         signalFd_ = -1;
@@ -866,6 +960,33 @@ Value Daemon::dispatch(const Value& req) {
             return Result<void>::success();
         });
         return out;
+    }
+
+    // ----------------------------------------------------------------- peer --
+    if (cmd == "peer") {
+        std::string action = fstr(req, "action", "list");
+        if (action == "list") {
+            Value arr = Value::array();
+            for (auto& p : options_.peers) {
+                Value v = Value::object();
+                v.set("address", Value::str(p));
+                arr.push(v);
+            }
+            return arr;
+        }
+        if (action == "add") {
+            std::string addr = fstr(req, "address");
+            if (addr.empty()) throw UsageError("peer add: address required");
+            options_.peers.push_back(addr);
+            return Value::object().set("ok", Value::boolean(true));
+        }
+        if (action == "remove") {
+            std::string addr = fstr(req, "address");
+            auto it = std::remove(options_.peers.begin(), options_.peers.end(), addr);
+            options_.peers.erase(it, options_.peers.end());
+            return Value::object().set("ok", Value::boolean(true));
+        }
+        throw UsageError("peer: unknown action '" + action + "'");
     }
 
     throw UsageError("unknown command '" + cmd + "'");

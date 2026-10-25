@@ -65,7 +65,7 @@ void RbacStore::seedDefaults() {
         permissions_.push_back({id,name,desc});
     };
     // permissions
-    const char* resources[] = {"clusters","credentials","replications","targets","policies","buckets","objects","audit","rbac","settings","explorer"};
+    const char* resources[] = {"clusters","credentials","replications","targets","policies","buckets","objects","audit","rbac","settings","explorer","s3mmws"};
     const char* actions[] = {"read","write","manage"};
     for (auto r : resources) for (auto a : actions) addPerm(std::string(r)+":"+a, std::string(r)+":"+a, "");
     addPerm("*:*","*:*","wildcard");
@@ -81,7 +81,11 @@ void RbacStore::seedDefaults() {
     std::vector<std::string> audPerms; for(auto&p:permissions_) if(p.id.find(":read")!=std::string::npos || p.id.rfind("audit:",0)==0) audPerms.push_back(p.id);
     addRole("auditor","Auditor",audPerms);
     std::vector<std::string> viewPerms; for(auto&p:permissions_) if(p.id.find(":read")!=std::string::npos) viewPerms.push_back(p.id);
-    addRole("viewer","Viewer",viewPerms);
+    {
+        std::vector<std::string> cjoin;
+        for(auto&p:permissions_){ if(p.id=="s3mmws:manage" || p.id=="s3mmws:write" || p.id=="s3mmws:read") cjoin.push_back(p.id); }
+        addRole("cluster-join","Cluster Join",cjoin);
+    }
     persist();
 }
 

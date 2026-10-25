@@ -1,0 +1,10 @@
+[
+  {
+    "username": "admin",
+    "display_name": "Administrator",
+    "email": "",
+    "salt": "Qmw5hOXs4J2wgWakUf4yiA==",
+    "hash": "IJgRH8tRvzG+uwRRujui+zqrRWe+gTX8APUyvthz6W8=",
+    "roles": ["admin"]
+  }
+]

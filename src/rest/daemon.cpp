@@ -4,6 +4,9 @@
 #include <chrono>
 #include <poll.h>
 #include <unistd.h>
+#include "s3mm/rest/cluster.hpp"
+#include "s3mm/rest/module.hpp"
+#include <curl/curl.h>
 
 #include "s3mm/common/fs.hpp"
 #include "s3mm/common/str.hpp"
@@ -21,6 +24,95 @@ namespace s3mm::rest {
 namespace {
 volatile std::sig_atomic_t gStop = 0;
 void onSignal(int) { gStop = 1; }
+
+static size_t curlWriteCb(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    std::string* s = (std::string*)userdata;
+    s->append(ptr, size*nmemb);
+    return size*nmemb;
+}
+
+static std::string httpGetJson(const std::string& address, const std::string& path, const std::string& secret="") {
+    CURL* curl = curl_easy_init();
+    if (!curl) return "";
+    std::string url = address;
+    if (url.find("http") != 0) url = "http://" + url;
+    if (url.back() == '/') url.pop_back();
+    url += path;
+    std::string resp;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    struct curl_slist* headers = nullptr;
+    headers = curl_slist_append(headers, "X-No-Peer-Merge: 1");
+    if (!secret.empty()) {
+        std::string h = "X-Cluster-Secret: " + secret;
+        headers = curl_slist_append(headers, h.c_str());
+    }
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteCb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+    curl_easy_perform(curl);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return resp;
+}
+
+static std::string httpPutJson(const std::string& address, const std::string& path, const std::string& body, const std::string& secret="") {
+    CURL* curl = curl_easy_init();
+    if (!curl) return "";
+    std::string url = address;
+    if (url.find("http") != 0) url = "http://" + url;
+    if (url.back() == '/') url.pop_back();
+    url += path;
+    std::string resp;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.size());
+    struct curl_slist* headers = nullptr;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    headers = curl_slist_append(headers, "X-No-Peer-Merge: 1");
+    if (!secret.empty()) {
+        std::string h = "X-Cluster-Secret: " + secret;
+        headers = curl_slist_append(headers, h.c_str());
+    }
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteCb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    curl_easy_perform(curl);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return resp;
+}
+
+static std::string httpPostJson(const std::string& address, const std::string& path, const std::string& body, const std::string& secret="") {
+    CURL* curl = curl_easy_init();
+    if (!curl) return "";
+    std::string url = address;
+    if (url.find("http") != 0) url = "http://" + url;
+    if (url.back() == '/') url.pop_back();
+    url += path;
+    std::string resp;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.size());
+    struct curl_slist* headers = nullptr;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    headers = curl_slist_append(headers, "X-No-Peer-Merge: 1");
+    if (!secret.empty()) {
+        std::string h = "X-Cluster-Secret: " + secret;
+        headers = curl_slist_append(headers, h.c_str());
+    }
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteCb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    curl_easy_perform(curl);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return resp;
+}
 }
 
 RestDaemon::RestDaemon(Options options)
@@ -81,6 +173,44 @@ void RestDaemon::registerDefaults() {
         }
         try {
             Value data = daemonClient_.call(parsed);
+            // If this is a list command, tag ownership and merge from peers.
+            std::string cmd = parsed.find("cmd") && parsed.find("cmd")->isString() ? parsed.find("cmd")->asString() : "";
+            std::string kind = parsed.find("kind") && parsed.find("kind")->isString() ? parsed.find("kind")->asString() : "";
+            bool noMerge = req.headers.count("X-No-Peer-Merge") > 0;
+            bool isList = (cmd == "list");
+            bool isResource = (kind == "cluster" || kind == "credential" || kind == "replication" || kind == "target" || kind == "policy");
+            if (isList && isResource && data.isArray() && cluster_ && !noMerge) {
+                std::string localOwner = "local";
+                Value merged = Value::array();
+                for (auto& it : data.items()) {
+                    Value copy = it;
+                    if (copy.isObject()) copy.set("_owner", Value::str(localOwner));
+                    merged.push(copy);
+                }
+                for (auto& peer : cluster_->peers()) {
+                    std::string peerResp = httpPostJson(peer.address, "/rpc", req.body, cluster_ ? cluster_->config().clusterSecret : "");
+                    std::string perr; Value pv = Value::parseJson(peerResp, &perr);
+                    if (perr.empty() && pv.isArray()) {
+                        std::string owner = peer.address;
+                        for (auto& it : pv.items()) {
+                            if (it.isObject() && it.find("name") && it.find("name")->isString()) {
+                                std::string nm = it.find("name")->asString();
+                                // skip proxy clusters and duplicates of local clusters
+                                if (nm.rfind("peer-", 0) == 0) continue;
+                                bool existsLocal = false;
+                                for (auto& lit : data.items()) {
+                                    if (lit.isObject() && lit.find("name") && lit.find("name")->isString() && lit.find("name")->asString() == nm) { existsLocal = true; break; }
+                                }
+                                if (existsLocal) continue;
+                            }
+                            Value copy = it;
+                            if (copy.isObject()) copy.set("_owner", Value::str(owner));
+                            merged.push(copy);
+                        }
+                    }
+                }
+                data = merged;
+            }
             res.json(data);
         } catch (const std::exception& e) {
             res.status = 502;
@@ -195,6 +325,137 @@ void RestDaemon::registerDefaults() {
         p = Value::object(); p.set("name", Value::str("ldap")); p.set("enabled", Value::boolean(ldap_ && ldap_->enabled())); arr.push(p);
         p = Value::object(); p.set("name", Value::str("keycloak")); p.set("enabled", Value::boolean(keycloak_ && keycloak_->enabled())); arr.push(p);
         res.json(arr);
+    });
+    // wscluster endpoints
+    router_.add("GET", "/wscluster/status", [this](const RestRequest&, RestResponse& res) {
+        if (!cluster_) { res.status=503; res.json(Value::object().set("error",Value::str("unavailable"))); return; }
+        res.json(cluster_->getStatus());
+    });
+    router_.add("POST", "/wscluster/init", [this](const RestRequest& req, RestResponse& res) {
+        std::string pe; Value body = Value::parseJson(req.body, &pe);
+        if (pe.size()||!body.isObject()){res.status=400;res.json(Value::object().set("error",Value::str("bad request")));return;}
+        std::string username = body.find("username") && body.find("username")->isString() ? body.find("username")->asString() : "";
+        std::string password = body.find("password") && body.find("password")->isString() ? body.find("password")->asString() : "";
+        if (options_.auth.enabled && local_ && local_->enabled() && !username.empty()) {
+            auto ar = local_->authenticate(username, password);
+            if (!ar.ok) { res.status=401; res.json(Value::object().set("error",Value::str("unauthorized"))); return; }
+            bool okPerm = false;
+            if (rbac_) { okPerm = rbac_->hasPermission(ar.user, "s3mmws:manage") || rbac_->hasPermission(ar.user, "s3mmws:write"); }
+            if (!okPerm) { res.status=403; res.json(Value::object().set("error",Value::str("forbidden"))); return; }
+        }
+        if (!cluster_) { res.status=503; res.json(Value::object().set("error",Value::str("unavailable"))); return; }
+        res.json(cluster_->initFromLogin(username, password));
+    });
+    router_.add("GET", "/wscluster/peers", [this](const RestRequest&, RestResponse& res) {
+        if (!cluster_) { res.status=503; res.json(Value::object().set("error",Value::str("unavailable"))); return; }
+        res.json(cluster_->listPeers());
+    });
+    router_.add("POST", "/wscluster/peers", [this](const RestRequest& req, RestResponse& res) {
+        std::string pe; Value body = Value::parseJson(req.body, &pe);
+        if (pe.size()||!body.isObject()){res.status=400;res.json(Value::object().set("error",Value::str("bad request")));return;}
+        std::string address = body.find("address") && body.find("address")->isString() ? body.find("address")->asString() : "";
+        if (address.empty()) { res.status=400; res.json(Value::object().set("error",Value::str("address required"))); return; }
+        if (!cluster_) { res.status=503; res.json(Value::object().set("error",Value::str("unavailable"))); return; }
+        std::string nodeId;
+        std::string st = httpGetJson(address, "/wscluster/status");
+        std::string serr; Value sv = Value::parseJson(st, &serr);
+        if (serr.empty() && sv.isObject() && sv.find("node_id") && sv.find("node_id")->isString()) nodeId = sv.find("node_id")->asString();
+        bool ok = cluster_->addPeer(address, nodeId);
+        res.json(Value::object().set("ok", Value::boolean(ok)));
+    });
+    router_.add("DELETE", "/wscluster/peers", [this](const RestRequest& req, RestResponse& res) {
+        std::string address = req.query.count("address") ? req.query.at("address") : "";
+        if (address.empty()) { res.status=400; res.json(Value::object().set("error",Value::str("address required"))); return; }
+        if (!cluster_) { res.status=503; res.json(Value::object().set("error",Value::str("unavailable"))); return; }
+        bool ok = cluster_->removePeer(address);
+        res.json(Value::object().set("ok", Value::boolean(ok)));
+    });
+    router_.add("POST", "/wscluster/replicate", [this](const RestRequest& req, RestResponse& res) {
+        std::string pe; Value body = Value::parseJson(req.body, &pe);
+        if (pe.size()||!body.isObject()){res.status=400;res.json(Value::object().set("error",Value::str("bad request")));return;}
+        auto gs = [&](const std::string& k){ return body.find(k) && body.find(k)->isString() ? body.find(k)->asString() : std::string(); };
+        std::string srcAddr = gs("source");
+        std::string dstAddr = gs("dest");
+        bool srcLocal = srcAddr.empty() || srcAddr=="local";
+        bool dstLocal = dstAddr.empty() || dstAddr=="local";
+        if (srcLocal) srcAddr = "http://127.0.0.1:" + std::to_string(options_.port);
+        if (dstLocal) dstAddr = "http://127.0.0.1:" + std::to_string(options_.port);
+        std::string srcCluster = gs("sourceCluster");
+        std::string srcBucket = gs("sourceBucket");
+        std::string dstCluster = gs("destCluster");
+        std::string dstBucket = gs("destBucket");
+        std::string prefix = gs("prefix");
+        std::string secret = cluster_ ? cluster_->config().clusterSecret : "";
+
+        // List source objects
+        std::vector<std::pair<std::string,std::string>> objects; // key, b64 content placeholder
+        // We'll collect keys first
+        std::vector<std::string> keys;
+        if (srcLocal) {
+            auto client = makeClient(srcCluster);
+            if (!client) { res.status=404; res.json(Value::object().set("error",Value::str("source cluster not found"))); return; }
+            auto page = client->listObjects(srcBucket, prefix);
+            if (!page) { res.status=502; res.json(Value::object().set("error",Value::str(page.error()))); return; }
+            for (auto& o : page.value().objects) keys.push_back(o.key);
+        } else {
+            std::string url = "/browse/objects?cluster=" + srcCluster + "&bucket=" + srcBucket;
+            if (!prefix.empty()) url += "&prefix=" + prefix;
+            std::string listResp = httpGetJson(srcAddr, url, secret);
+            std::string lerr; Value lv = Value::parseJson(listResp, &lerr);
+            if (lerr.size() || !lv.isObject()) { res.status=502; res.json(Value::object().set("error",Value::str("source list failed"))); return; }
+            const Value* objs = lv.find("objects");
+            if (!objs || !objs->isArray()) { res.status=502; res.json(Value::object().set("error",Value::str("no objects"))); return; }
+            for (auto& o : objs->items()) {
+                std::string key = o.find("key") && o.find("key")->isString() ? o.find("key")->asString() : std::string();
+                if (!key.empty()) keys.push_back(key);
+            }
+        }
+
+        int copied = 0, failed = 0;
+        for (auto& key : keys) {
+            std::string b64, ct = "application/octet-stream";
+            // fetch content
+            if (srcLocal) {
+                auto client = makeClient(srcCluster);
+                auto meta = client->headObject(srcBucket, key);
+                uint64_t fetchSize = meta && meta.value().exists ? meta.value().size : 0;
+                if (fetchSize > 0) {
+                    auto range = client->getObjectRange(srcBucket, key, 0, fetchSize);
+                    if (range) b64 = crypto::base64Encode(range.value());
+                }
+                if (meta && meta.value().exists) ct = meta.value().contentType;
+            } else {
+                std::string contentUrl = "/browse/object-content?cluster=" + srcCluster + "&bucket=" + srcBucket + "&key=" + key;
+                std::string cResp = httpGetJson(srcAddr, contentUrl, secret);
+                std::string cerr; Value cv = Value::parseJson(cResp, &cerr);
+                if (!cerr.empty() && cv.isObject()) {
+                    b64 = cv.find("content_base64") && cv.find("content_base64")->isString() ? cv.find("content_base64")->asString() : "";
+                    ct = cv.find("content_type") && cv.find("content_type")->isString() ? cv.find("content_type")->asString() : ct;
+                } else { failed++; continue; }
+            }
+            Value putBody = Value::object();
+            putBody.set("content_base64", Value::str(b64));
+            putBody.set("content_type", Value::str(ct));
+            // dest
+            if (dstLocal) {
+                auto client = makeClient(dstCluster);
+                if (!client) { failed++; continue; }
+                s3::ObjectMeta meta; meta.contentType = ct;
+                std::string content = crypto::base64Decode(b64).value_or("");
+                auto put = client->putObject(dstBucket, key, content, meta);
+                if (put) copied++; else failed++;
+            } else {
+                std::string putUrl = "/browse/object?cluster=" + dstCluster + "&bucket=" + dstBucket + "&key=" + key;
+                std::string putResp = httpPutJson(dstAddr, putUrl, putBody.toJson(0), secret);
+                std::string perr; Value pv = Value::parseJson(putResp, &perr);
+                if (perr.empty() && pv.isObject() && pv.find("ok") && pv.find("ok")->asBool(false)) copied++;
+                else failed++;
+            }
+        }
+        Value out = Value::object();
+        out.set("copied", Value::number((int64_t)copied));
+        out.set("failed", Value::number((int64_t)failed));
+        res.json(out);
     });
     router_.add("POST", "/auth/login", [this](const RestRequest& req, RestResponse& res) {
         std::string pe; Value body = Value::parseJson(req.body, &pe);
@@ -774,6 +1035,32 @@ int RestDaemon::run() {
             }
         }
     }
+    // parse wscluster config
+    if (!options_.config.empty()) {
+        auto cfg2 = config::Config::load(options_.config);
+        if (cfg2) {
+            const config::Node* s3mm2 = cfg2.value().s3mm();
+            const config::Node* wc = s3mm2 ? s3mm2->find("wscluster") : nullptr;
+            if (wc && wc->block) {
+                options_.wscluster.enabled = wc->boolValue("enabled", false);
+                options_.wscluster.bind = wc->value("bind", options_.wscluster.bind);
+                options_.wscluster.port = (int)wc->int64Value("port", options_.wscluster.port);
+                options_.wscluster.certsDir = wc->value("certs_dir");
+                options_.wscluster.useMtls = wc->boolValue("use_mtls", options_.wscluster.useMtls);
+                options_.wscluster.clusterSecret = wc->value("cluster_secret");
+            }
+        }
+    }
+    cluster_ = std::make_unique<ClusterManager>();
+    ClusterConfig cc;
+    cc.nodeId = cluster_->nodeId();
+    cc.enabled = options_.wscluster.enabled;
+    cc.bind = options_.wscluster.bind;
+    cc.port = options_.wscluster.port;
+    cc.certsDir = options_.wscluster.certsDir;
+    cc.useMtls = options_.wscluster.useMtls;
+    cc.clusterSecret = options_.wscluster.clusterSecret;
+    cluster_->setConfig(cc);
     daemonClient_ = cli::Client(options_.socket);
     if (options_.modulesDir.empty()) options_.modulesDir = "./modules";
 
@@ -824,40 +1111,47 @@ int RestDaemon::run() {
                 // Built-in auth (only s3mmws level).
                 AuthUser currentUser;
                 bool haveUser = false;
-                bool isPublic = (req.path == "/health") || (req.path.rfind("/auth/",0)==0 && req.path != "/auth/me");
+                bool isPublic = (req.path == "/health") || (req.path.rfind("/auth/",0)==0 && req.path != "/auth/me") || (req.path == "/wscluster/init") || (req.path == "/wscluster/status"); 
                 // Actually /auth/me requires auth; handle below.
                 if (req.path == "/auth/me") isPublic = false;
+                bool clusterAuth = false;
                 if (options_.auth.enabled && !isPublic) {
-                    std::string tok;
-                    auto it = req.headers.find("Authorization");
-                    if (it != req.headers.end()) {
-                        std::string v = it->second;
-                        if (v.rfind("Bearer ",0)==0) tok = v.substr(7);
-                    }
-                    if (tok.empty() && req.headers.count("X-Auth-Token")) tok = req.headers.at("X-Auth-Token");
-                    auto u = sessions_->resolve(tok);
-                    if (!u) { res.status = 401; res.json(Value::object().set("error", Value::str("unauthorized"))); return; }
-                    currentUser = *u; haveUser = true;
-                    // permission check
-                    std::string resource = "explorer";
-                    if (req.path.rfind("/clusters",0)==0) resource="clusters";
-                    else if (req.path.rfind("/credentials",0)==0) resource="credentials";
-                    else if (req.path.rfind("/replications",0)==0) resource="replications";
-                    else if (req.path.rfind("/targets",0)==0) resource="targets";
-                    else if (req.path.rfind("/policies",0)==0) resource="policies";
-                    else if (req.path.rfind("/rbac",0)==0) resource="rbac";
-                    else if (req.path.rfind("/audit",0)==0) resource="audit";
-                    else if (req.path.rfind("/browse",0)==0) resource="explorer";
-                    else if (req.path.rfind("/status",0)==0) resource="clusters";
-                    else if (req.path.rfind("/modules",0)==0) resource="clusters";
-                    bool write = (req.method != "GET");
-                    std::string perm = resource + ":" + (write ? "write" : "read");
-                    // admin-ish manage for rbac writes
-                    if (resource=="rbac" && write) perm = "rbac:manage";
-                    if (!rbac_->hasPermission(currentUser, perm)) {
-                        res.status = 403;
-                        res.json(Value::object().set("error", Value::str("forbidden")));
-                        return;
+                    auto csit = req.headers.find("X-Cluster-Secret");
+                    if (csit != req.headers.end() && cluster_ && !cluster_->config().clusterSecret.empty() && csit->second == cluster_->config().clusterSecret) {
+                        currentUser.id = "cluster"; currentUser.username = "cluster"; currentUser.roles = {"admin"};
+                        haveUser = true; clusterAuth = true;
+                    } else {
+                        std::string tok;
+                        auto it = req.headers.find("Authorization");
+                        if (it != req.headers.end()) {
+                            std::string v = it->second;
+                            if (v.rfind("Bearer ",0)==0) tok = v.substr(7);
+                        }
+                        if (tok.empty() && req.headers.count("X-Auth-Token")) tok = req.headers.at("X-Auth-Token");
+                        auto u = sessions_->resolve(tok);
+                        if (!u) { res.status = 401; res.json(Value::object().set("error", Value::str("unauthorized"))); return; }
+                        currentUser = *u; haveUser = true;
+                        // permission check
+                        std::string resource = "explorer";
+                        if (req.path.rfind("/clusters",0)==0) resource="clusters";
+                        else if (req.path.rfind("/credentials",0)==0) resource="credentials";
+                        else if (req.path.rfind("/replications",0)==0) resource="replications";
+                        else if (req.path.rfind("/targets",0)==0) resource="targets";
+                        else if (req.path.rfind("/policies",0)==0) resource="policies";
+                        else if (req.path.rfind("/rbac",0)==0) resource="rbac";
+                        else if (req.path.rfind("/audit",0)==0) resource="audit";
+                        else if (req.path.rfind("/browse",0)==0) resource="explorer";
+                        else if (req.path.rfind("/status",0)==0) resource="clusters";
+                        else if (req.path.rfind("/modules",0)==0) resource="clusters";
+                        bool write = (req.method != "GET");
+                        std::string perm = resource + ":" + (write ? "write" : "read");
+                        // admin-ish manage for rbac writes
+                        if (resource=="rbac" && write) perm = "rbac:manage";
+                        if (!rbac_->hasPermission(currentUser, perm)) {
+                            res.status = 403;
+                            res.json(Value::object().set("error", Value::str("forbidden")));
+                            return;
+                        }
                     }
                 } else if (!options_.auth.enabled) {
                     // anonymous admin
@@ -867,6 +1161,91 @@ int RestDaemon::run() {
                     haveUser = true;
                 }
                 (void)haveUser; (void)currentUser;
+                // S3 proxy gateway for cross-segment access.
+                if (req.path.rfind("/s3proxy/", 0) == 0) {
+                    // path: /s3proxy/{cluster}/{bucket}/{key...}
+                    std::string rest = req.path.substr(9);
+                    size_t slash = rest.find('/');
+                    std::string cluster = (slash == std::string::npos) ? rest : rest.substr(0, slash);
+                    std::string remainder = (slash == std::string::npos) ? "" : rest.substr(slash + 1);
+                    size_t slash2 = remainder.find('/');
+                    std::string bucket = (slash2 == std::string::npos) ? remainder : remainder.substr(0, slash2);
+                    std::string key = (slash2 == std::string::npos) ? "" : remainder.substr(slash2 + 1);
+                    auto client = makeClient(cluster);
+                    if (!client) { res.status = 404; res.json(Value::object().set("error", Value::str("cluster not found"))); return; }
+                    if (bucket.empty()) {
+                        // ListBuckets not cluster-specific; return simple list
+                        res.status = 200; res.headers["Content-Type"] = "application/xml";
+                        res.body = "<ListAllMyBucketsResult><Buckets></Buckets></ListAllMyBucketsResult>";
+                        return;
+                    }
+                    if (key.empty()) {
+                        if (req.method == "GET") {
+                            auto page = client->listObjects(bucket, req.query.count("prefix") ? req.query.at("prefix") : "");
+                            if (!page) { res.status = 502; res.json(Value::object().set("error", Value::str(page.error()))); return; }
+                            std::ostringstream xml;
+                            xml << "<ListBucketResult><Name>" << bucket << "</Name><Contents>";
+                            for (auto& o : page.value().objects) {
+                                xml << "<Contents><Key>" << o.key << "</Key><Size>" << o.size << "</Size><LastModified>" << o.lastModified << "</LastModified><ETag>" << o.etag << "</ETag></Contents>";
+                            }
+                            xml << "</Contents></ListBucketResult>";
+                            res.status = 200; res.headers["Content-Type"] = "application/xml"; res.body = xml.str();
+                            return;
+                        }
+                        if (req.method == "PUT") {
+                            auto created = client->createBucket(bucket);
+                            if (!created) { res.status = 502; res.json(Value::object().set("error", Value::str(created.error()))); return; }
+                            res.status = 200; res.body = "";
+                            return;
+                        }
+                        if (req.method == "DELETE") {
+                            auto del = client->deleteBucket(bucket);
+                            if (!del) { res.status = 502; res.json(Value::object().set("error", Value::str(del.error()))); return; }
+                            res.status = 204; res.body = "";
+                            return;
+                        }
+                    } else {
+                        if (req.method == "GET") {
+                            auto meta = client->headObject(bucket, key);
+                            if (!meta || !meta.value().exists) { res.status = 404; res.body = ""; return; }
+                            uint64_t sz = meta.value().size;
+                            std::string content;
+                            if (sz > 0) {
+                                auto range = client->getObjectRange(bucket, key, 0, sz);
+                                if (range) content = range.value();
+                            }
+                            res.status = 200;
+                            res.headers["Content-Type"] = meta.value().contentType.empty() ? "application/octet-stream" : meta.value().contentType;
+                            res.body = content;
+                            return;
+                        }
+                        if (req.method == "HEAD") {
+                            auto meta = client->headObject(bucket, key);
+                            if (!meta || !meta.value().exists) { res.status = 404; return; }
+                            res.status = 200;
+                            res.headers["Content-Type"] = meta.value().contentType.empty() ? "application/octet-stream" : meta.value().contentType;
+                            res.headers["Content-Length"] = std::to_string(meta.value().size);
+                            res.body = "";
+                            return;
+                        }
+                        if (req.method == "PUT") {
+                            s3::ObjectMeta meta;
+                            meta.contentType = req.headers.count("Content-Type") ? req.headers.at("Content-Type") : "application/octet-stream";
+                            auto put = client->putObject(bucket, key, req.body, meta);
+                            if (!put) { res.status = 502; res.json(Value::object().set("error", Value::str(put.error()))); return; }
+                            res.status = 200; res.body = "";
+                            return;
+                        }
+                        if (req.method == "DELETE") {
+                            auto del = client->deleteObject(bucket, key);
+                            if (!del) { res.status = 502; res.json(Value::object().set("error", Value::str(del.error()))); return; }
+                            res.status = 204; res.body = "";
+                            return;
+                        }
+                    }
+                    res.status = 405; res.body = "";
+                    return;
+                }
                 // Request processing chain.
                 for (auto* m : modules_) {
                     if (m->process(req, res)) return;

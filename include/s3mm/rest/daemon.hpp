@@ -10,6 +10,7 @@
 #include "s3mm/rest/module.hpp"
 #include "s3mm/rest/auth.hpp"
 #include "s3mm/rest/rbac.hpp"
+#include "s3mm/rest/cluster.hpp"
 #include "s3mm/registry/registry.hpp"
 #include "s3mm/s3/client.hpp"
 #include "s3mm/cli/client.hpp"
@@ -26,6 +27,16 @@ struct AuthSettings {
     bool localEnabled = true;
 };
 
+struct WsClusterSettings {
+    bool enabled = false;
+    std::string bind = "127.0.0.1";
+    int port = 9443;
+    std::string certsDir;
+    bool useMtls = true;
+    std::string clusterSecret;
+    std::vector<std::string> peers;
+};
+
 struct Options {
     std::string config = "/etc/s3mm/s3mm.conf";
     std::string socket;
@@ -35,6 +46,7 @@ struct Options {
     bool daemonize = false;
     bool validateOnly = false;
     AuthSettings auth;
+    WsClusterSettings wscluster;
 };
 
 class RestDaemon {
@@ -64,6 +76,7 @@ private:
     std::unique_ptr<LocalAuthProvider> local_;
     std::unique_ptr<LdapAuthProvider> ldap_;
     std::unique_ptr<KeycloakAuthProvider> keycloak_;
+    std::unique_ptr<ClusterManager> cluster_;
 };
 
 } // namespace s3mm::rest

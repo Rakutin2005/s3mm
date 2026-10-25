@@ -329,6 +329,15 @@ std::vector<std::string> Config::validate() const {
     for (const char* kind : {"cluster", "credential", "policy", "replication", "target", "user"})
         checkUniqueNames(*s3mm_, kind, errors);
 
+    if (const auto* sk = s3mm_->find("socket")) {
+        if (!sk->args.empty()) {
+            const std::string& sp = sk->args[0];
+            if (sp.find("://") != std::string::npos || (sp.find(':') != std::string::npos && sp.find('/') == std::string::npos)) {
+                errors.push_back(sk->file + ":" + std::to_string(sk->line) + ": s3mmd control socket must be a UNIX domain socket path, not a network address");
+            }
+        }
+    }
+
     std::set<std::string> clusters, credentials, policies, targets, replications;
     for (const auto& c : s3mm_->children) {
         if (c.name == "cluster" && c.block) clusters.insert(c.argOr(0));

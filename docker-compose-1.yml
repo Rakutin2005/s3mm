@@ -1,0 +1,66 @@
+version: "3.8"
+services:
+  minio1:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "29100:9000"
+      - "29101:9001"
+    volumes:
+      - minio1-data:/data
+
+  minio2:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "29102:9000"
+      - "29103:9001"
+    volumes:
+      - minio2-data:/data
+
+  rustfs1:
+    image: rustfs/rustfs:latest
+    environment:
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin
+    ports:
+      - "29104:9000"
+      - "29105:9001"
+    volumes:
+      - rustfs1-data:/data
+
+  s3mmd:
+    build:
+      context: .
+      dockerfile: Dockerfile.s3mm
+    command: ["/usr/local/bin/s3mmd", "-c", "/etc/s3mm/s3mm.conf"]
+    volumes:
+      - ./docker/etc1:/etc/s3mm
+    depends_on:
+      - minio1
+      - minio2
+      - rustfs1
+
+  s3mmws:
+    build:
+      context: .
+      dockerfile: Dockerfile.s3mm
+    command: ["/usr/local/bin/s3mmws", "-c", "/etc/s3mm/s3mm.conf", "-l", "0.0.0.0", "-p", "8080"]
+    ports:
+      - "8082:8080"
+      - "9443:9443"
+    volumes:
+      - ./docker/etc1:/etc/s3mm
+    depends_on:
+      - s3mmd
+
+volumes:
+  minio1-data:
+  minio2-data:
+  rustfs1-data:

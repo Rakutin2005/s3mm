@@ -1,0 +1,7 @@
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake g++ make libargon2-dev libldap2-dev liblber2-dev libcurl4-openssl-dev libssl-dev zlib1g-dev && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . /src
+RUN mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j4 s3mmd s3mmws
+RUN cp /src/build/s3mmd /src/build/s3mmws /usr/local/bin/

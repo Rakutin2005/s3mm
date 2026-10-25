@@ -13,6 +13,12 @@ namespace s3mm::daemon {
 
 Result<void> ControlServer::listen(const std::string& socketPath) {
     if (socketPath.empty()) return Result<void>::failure("control socket path is empty");
+    if (socketPath.find("://") != std::string::npos) {
+        return Result<void>::failure("s3mmd control socket must be a Unix socket path, not a URI");
+    }
+    if (socketPath.find(':') != std::string::npos && socketPath.find('/') == std::string::npos) {
+        return Result<void>::failure("s3mmd control socket must be a Unix socket path, not a network address");
+    }
     std::string dir = fs::dirname(socketPath);
     if (!dir.empty() && !fs::mkdirp(dir))
         return Result<void>::failure("cannot create socket directory " + dir);
