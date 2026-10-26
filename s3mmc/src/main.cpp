@@ -33,6 +33,7 @@ void usage(std::FILE* out) {
                  "Commands:\n"
                  "  (default)             run the cluster client daemon\n"
                  "  status                print link/route state of the running instance\n"
+                 "  visibility <peer>     effective inventory visibility for one peer\n"
                  "\n"
                  "Options:\n"
                  "  -c, --config <file>   configuration file (default /etc/s3mmc/s3mmc.conf)\n"
@@ -41,24 +42,25 @@ void usage(std::FILE* out) {
                  "  -V, --version         show version\n");
 }
 
-/// Send one control frame to the running instance and print the reply.
-int runStatus(const std::string& runDir, const std::string& nodeId, bool json) {
+/// Send one raw control request line; returns the reply line (empty on error).
+std::string controlQuery(const std::string& runDir, const std::string& nodeId,
+                         const std::string& request, std::string* error) {
     std::string path = runDir + "/" + nodeId + "/s3mmc.sock";
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) { std::perror("s3mmc status: socket"); return 1; }
+    if (fd < 0) { *error = "socket: " + std::string(strerror(errno)); return {}; }
     sockaddr_un un{};
     un.sun_family = AF_UNIX;
     std::strncpy(un.sun_path, path.c_str(), sizeof(un.sun_path) - 1);
     if (::connect(fd, reinterpret_cast<sockaddr*>(&un), sizeof(un)) < 0) {
-        std::fprintf(stderr, "s3mmc: cannot reach %s: %s\n", path.c_str(), strerror(errno));
+        *error = "cannot reach " + path + ": " + strerror(errno);
         ::close(fd);
-        return 1;
+        return {};
     }
-    std::string req = "{\"cmd\":\"status\"}\n";
+    std::string req = request + "\n";
     if (::send(fd, req.data(), req.size(), MSG_NOSIGNAL) != (ssize_t)req.size()) {
-        std::fprintf(stderr, "s3mmc: send failed\n");
+        *error = "send failed";
         ::close(fd);
-        return 1;
+        return {};
     }
     std::string line;
     char c;
@@ -67,6 +69,17 @@ int runStatus(const std::string& runDir, const std::string& nodeId, bool json) {
         line.push_back(c);
     }
     ::close(fd);
+    return line;
+}
+
+/// Send one control frame to the running instance and print the reply.
+int runStatus(const std::string& runDir, const std::string& nodeId, bool json) {
+    std::string err;
+    std::string line = controlQuery(runDir, nodeId, "{\"cmd\":\"status\"}", &err);
+    if (line.empty()) {
+        std::fprintf(stderr, "s3mmc: %s\n", err.c_str());
+        return 1;
+    }
     auto v = s3mm::Value::parseJson(line);
     if (json) {
         std::printf("%s\n", line.c_str());
@@ -90,6 +103,38 @@ int runStatus(const std::string& runDir, const std::string& nodeId, bool json) {
         for (const auto& r : routes->items())
             std::printf("  remote[%-20s] via %s\n", r.getString("cluster").c_str(),
                         r.getString("via").c_str());
+    }
+    return 0;
+}
+
+int runVisibility(const std::string& runDir, const std::string& nodeId,
+                  const std::string& peer, bool json) {
+    std::string req = "{\"cmd\":\"visibility\",\"peer\":\"" + peer + "\"}";
+    std::string err;
+    std::string line = controlQuery(runDir, nodeId, req, &err);
+    if (line.empty()) {
+        std::fprintf(stderr, "s3mmc: %s\n", err.c_str());
+        return 1;
+    }
+    if (json) { std::printf("%s\n", line.c_str()); return 0; }
+    auto v = s3mm::Value::parseJson(line);
+    if (!v.isObject() || (v.find("ok") && !v.find("ok")->asBool())) {
+        std::fprintf(stderr, "s3mmc: %s\n", v.getString("error").c_str());
+        return 1;
+    }
+    std::printf("peer:    %s\n", v.getString("peer").c_str());
+    std::printf("manager: %s\n", (v.find("manager") && v.find("manager")->asBool()) ? "yes" : "no");
+    std::printf("mode:    %s\n", v.getString("mode").c_str());
+    if (const s3mm::Value* el = v.find("elements"); el && el->isArray()) {
+        std::printf("elements:");
+        for (const auto& e : el->items()) std::printf(" %s", e.asString().c_str());
+        std::printf("\n");
+    }
+    if (const s3mm::Value* wd = v.find("would_disclose"); wd && wd->isObject()) {
+        std::printf("discloses now: clusters=%lld replications=%lld local_clusters=%lld\n",
+                    (long long)wd->find("clusters")->asInt(0),
+                    (long long)wd->find("replications")->asInt(0),
+                    (long long)wd->find("local_clusters")->asInt(0));
     }
     return 0;
 }
@@ -140,6 +185,14 @@ int main(int argc, char** argv) {
     if (command == "status") {
         auto cur = client.options();
         return runStatus(cur.runDir, cur.nodeId, jsonOut);
+    }
+    if (command == "visibility") {
+        auto cur = client.options();
+        if (optind >= argc) {
+            std::fprintf(stderr, "s3mmc visibility: <peer-id> required\n");
+            return 2;
+        }
+        return runVisibility(cur.runDir, cur.nodeId, argv[optind], jsonOut);
     }
     if (!command.empty()) {
         std::fprintf(stderr, "s3mmc: unknown command '%s'\n", command.c_str());

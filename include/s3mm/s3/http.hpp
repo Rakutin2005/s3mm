@@ -23,7 +23,7 @@ struct Response {
 
 struct Request {
     std::string method = "GET";
-    std::string url;                                 // scheme://host[:port]/path
+    std::string url;                                 // scheme://host[:port]/path, or unix:/path/to/sock#scheme://host:port/path
     std::map<std::string, std::string> query;        // sorted at send time
     std::map<std::string, std::string> headers;      // header name -> value
     std::string body;                                // in-memory body

@@ -94,12 +94,41 @@ public:
         int64_t coreTimeoutSec = 300;       // GET-wait budget towards local core
         uint64_t spoolThresholdBytes = 1ull << 20;
         /// Managers of this node ("*" | list of peer ids/CNs | empty = none).
-        /// A manager may patch our config and pull credentials over the cluster
-        /// channel. Identity is the CN of the peer's mTLS certificate.
+        /// A manager receives the FULL unfiltered inventory, may patch our
+        /// config and pull credentials over the cluster channel. Identity is
+        /// the CN of the peer's mTLS certificate.
         std::vector<std::string> managedNodes;
-        /// When true, ANY connected peer may request S3 credentials from us
-        /// (sealed for its own passphrase). Managers may always do so.
-        bool exposeCredentials = false;
+        /// on: bind a remote[id] UNIX socket only when some local replication
+        /// rule actually references that foreign cluster (lazy creation on
+        /// demand); off: bind sockets for every cluster known from the merged
+        /// inventory.
+        bool requiredOnly = true;
+
+        // ---- per-peer visibility ACL ------------------------------------------
+        // Non-managers see only what the matching ACL entry grants them;
+        // managers ignore ACLs entirely and always receive everything.
+        struct PeerAcl {
+            std::string pattern;   // peer id / CN, glob ("*", "zone-*")
+            int priority = 0;      // explicit numeric `order`, then specificity
+            // Inventory element names this peer may see. Glob patterns with
+            // leading '!' as exclusions (same semantics as policy filters):
+            // "*" = all; {"clusters","!endpoints"} = clusters minus endpoints.
+            // Recognised names: clusters, endpoints, zones, aliases, vendor,
+            // replications, local_clusters, credentials.
+            std::vector<std::string> elements;
+        };
+        struct ExposeRule {
+            std::string spec;          // raw value: "*" | "none" | "a,!b,c"
+            std::string appliesTo;     // "unmanaged" | "all" | "<peer-id>" | glob
+            int order = 0;             // explicit precedence (lower wins)
+            int line = 0;              // config line — stable tie-breaker
+        };
+        /// Expose directives in file order (used when no ACL entries exist).
+        std::vector<ExposeRule> exposeRules;
+        /// Compiled per-peer ACL, derived from exposeRules by configure().
+        /// Empty => legacy behaviour: opts_.exposeInventory filter for all
+        /// non-managers (back-compat with single global `expose`).
+        std::vector<PeerAcl> peerAcls;
     };
 
     explicit ClusterClient(Options opts, TlsConfig tls);
@@ -129,6 +158,30 @@ public:
     /// Directory holding sealed credential PEM files (default /etc/s3mm/secrets)
     /// and the master-key file used to re-seal them for a manager.
     void setSecretsDir(const std::string& dir, const std::string& masterKeyFile = {});
+
+    // ---- inventory visibility & socket provisioning -----------------------
+    /// Normalise an expose value ("*" | "none" | names with optional "!"
+    /// exclusions). Exposed for config parsing and CLI validation.
+    static Result<std::vector<std::string>> parseExposeList(const std::string& spec);
+    /// Compile opts_.exposeRules into the ordered per-peer ACL table
+    /// (opts_.peerAcls). Rules without `to` default to "unmanaged"; a bare
+    /// `expose <list>;` (no block form) is kept as the legacy global filter.
+    static Result<void> compilePeerAcls(Options& opts);
+    /// The ACL entry governing `peerId`, or nullptr when no ACL table exists.
+    /// Managers never consult ACLs — see filteredInventoryFor().
+    const Options::PeerAcl* aclForLocked(const std::string& peerId) const;
+    /// Our local snapshot as it would be disclosed to `peerId`: managers get
+    /// everything; non-managers get the view filtered by their ACL entry.
+    peer::Inventory filteredInventoryFor(const std::string& peerId) const;
+    /// Effective visibility summary for one peer (manager flag, matched ACL,
+    /// element list, disclosure counts). Served on the control socket.
+    Value describeVisibility(const std::string& peerId) const;
+    /// Bind (if not bound yet) the remote[id] UNIX listener. Called on demand
+    /// when requiredOnly=true and a task/socket request needs that cluster.
+    Result<void> ensureRemoteSocket(const std::string& clusterId);
+    /// Foreign clusters referenced by our own replication rules (destination
+    /// or source that we do not own locally) — the "required" socket set.
+    std::vector<std::string> requiredClustersLocked() const;
     /// Current s3mmc.conf text read from disk (empty + false on failure).
     bool currentConfigText(std::string* text, std::string* error) const;
     /// Validate `text` and persist it over the live config file, then apply
@@ -239,8 +292,8 @@ private:
     void dropSessionByChannel(const std::shared_ptr<Channel>& ch, const std::string& reason);
 
     std::string sendOnPeer(const std::string& peerId, const Value& frame);
-    Value buildHelloFrame();
-    Value buildInventoryFrame();
+    Value buildHelloFrame(const std::string& forPeer = {});
+    Value buildInventoryFrame(const std::string& forPeer = {});
     void applyInventoryFrom(const std::string& peerId, const peer::Inventory& inv);
     void mergeViewsLocked();
     void rebuildRoutesLocked();

@@ -77,14 +77,77 @@ Result<void> applyConfigText(ClusterClient& client, const std::string& text,
         if (!ml) return Result<void>::failure(ml.error());
         opts.managedNodes = ml.value();
     }
-    if (auto v = firstNonEmpty(scopes, "expose_credentials"); !v.empty()) {
+    // (retired) expose_credentials: credential visibility is now governed by
+    // the per-peer `expose` ACL — a peer listed with element `credentials`
+    // may request sealed credentials over the cluster channel. Managers may
+    // always do so regardless of ACLs.
+    if (!firstNonEmpty(scopes, "expose_credentials").empty())
+        return Result<void>::failure("expose_credentials is retired; use 'expose { credentials; to <peer>; }' instead");
+    // required_only: bind remote[id] UNIX sockets only for clusters that our
+    // own replication rules reference (lazy provisioning). off => provision
+    // every cluster known from the merged inventory.
+    if (auto v = firstNonEmpty(scopes, "required_only"); !v.empty()) {
         if (v == "on" || v == "true" || v == "yes" || v == "1")
-            opts.exposeCredentials = true;
+            opts.requiredOnly = true;
         else if (v == "off" || v == "false" || v == "no" || v == "0")
-            opts.exposeCredentials = false;
+            opts.requiredOnly = false;
         else
-            return Result<void>::failure("expose_credentials must be on|off, got '" + v + "'");
+            return Result<void>::failure("required_only must be on|off, got '" + v + "'");
     }
+    // expose — per-peer inventory visibility ACL.
+    //   expose { clusters replications !endpoints; to = s3c-2; order = 10; };
+    //   expose *;                       (legacy global form, applies to unmanaged)
+    // Element spec: "*" = everything, "none" = nothing, "!"-prefixed names are
+    // exclusions, plain list = include exactly these. `to` selects the peers
+    // the rule governs: "unmanaged" (default), "all", a peer id/CN or a glob
+    // ("zone-*"). Managers ALWAYS see everything and ignore every expose rule.
+    // Rules with an explicit `to` compile into the ordered per-peer ACL table;
+    // bare legacy rules remain the global unmanaged filter.
+    for (const auto* sc : scopes) {
+        for (const auto& exN : sc->findAll("expose")) {
+            const config::Node& ex = *exN;
+            Options::ExposeRule rule;
+            rule.line = ex.line;
+            std::string spec;
+            // Accept both forms: `expose a b c;` (args) and `expose { a; b; };`
+            // (block — directive names become the element list).
+            for (size_t i = 0; i < 8 && ex.hasArg(i); ++i) {
+                if (!spec.empty()) spec += ",";
+                spec += ex.arg(i);
+            }
+            if (spec.empty()) {
+                for (const auto& d : ex.directives()) {
+                    if (d.name == "to" || d.name == "order") continue;
+                    if (!spec.empty()) spec += ",";
+                    spec += d.name;
+                    // nested negation form: `!endpoints;` parses as arg too
+                    if (d.hasArg(0) && !d.arg(0).empty() && d.name.empty())
+                        spec += d.arg(0);
+                }
+            }
+            if (spec.empty()) spec = "*";
+            auto el = ClusterClient::parseExposeList(spec);
+            if (!el) return Result<void>::failure(el.error());
+            rule.spec = spec;
+            // scoped block form: `to`/`order` may be nested directives ...
+            for (const auto& d : ex.directives()) {
+                if (d.name == "to" && d.hasArg(0)) rule.appliesTo = d.arg(0);
+                if (d.name == "order" && d.hasArg(0)) {
+                    try { rule.order = std::stoi(d.arg(0)); }
+                    catch (...) { return Result<void>::failure("expose: bad order '" + d.arg(0) + "'"); }
+                }
+            }
+            // ... or scalar args of `expose <spec> to <peer>;` style lines
+            if (rule.appliesTo.empty()) {
+                for (size_t i = 0; i < 8 && ex.hasArg(i); ++i)
+                    if (ex.arg(i) == "to" && ex.hasArg(i + 1)) { rule.appliesTo = ex.arg(i + 1); break; }
+            }
+            if (rule.appliesTo.empty()) rule.appliesTo = "unmanaged";
+            opts.exposeRules.push_back(std::move(rule));
+        }
+    }
+    auto aclR = ClusterClient::compilePeerAcls(opts);
+    if (!aclR) return Result<void>::failure(aclR.error());
     if (auto v = firstNonEmpty(scopes, "inventory"); !v.empty()) {
         if (v != "push" && v != "pull" && v != "both")
             return Result<void>::failure("inventory model must be push|pull|both, got '" + v + "'");

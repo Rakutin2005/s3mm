@@ -102,9 +102,19 @@ static size_t headerCallback(char* buffer, size_t size, size_t nitems, void* use
     return total;
 }
 
+struct FileSinkState {
+    std::FILE* file = nullptr;
+    int64_t limit = 0;      // 0 = unlimited
+    int64_t written = 0;
+};
+
 static size_t fileWriteCallback(char* ptr, size_t size, size_t nmemb, void* userdata) {
-    auto* f = static_cast<std::FILE*>(userdata);
-    return std::fwrite(ptr, size, nmemb, f);
+    auto* st = static_cast<FileSinkState*>(userdata);
+    size_t total = size * nmemb;
+    if (st->limit > 0 && st->written + (int64_t)total > st->limit) return 0; // abort: response too large
+    size_t n = std::fwrite(ptr, 1, total, st->file);
+    st->written += (int64_t)n;
+    return n; // < total aborts the transfer
 }
 
 struct ReadState {
@@ -155,10 +165,38 @@ Response Client::perform(const Request& request, void* curlFile) {
         return response;
     }
 
+    // Unix-socket transport: an endpoint of the form
+    //   unix:/path/to/sock#http://authority/path
+    // connects through the socket but keeps a normal http:// URL for signing
+    // and routing. s3mmc exposes each remote destination as such a socket, so
+    // the core treats a cluster behind the mesh like any local S3 endpoint.
     std::string url = request.url;
-    if (!request.query.empty()) url = buildUrl(request.url, "", request.query);
+    std::string unixSocketPath;
+    if (url.rfind("unix:", 0) == 0) {
+        auto hash = url.find('#');
+        if (hash == std::string::npos) {
+            response.curlError = "malformed unix endpoint (missing '#'): " + url;
+            curl_easy_cleanup(curl);
+            return response;
+        }
+        unixSocketPath = url.substr(5, hash - 5);
+        while (!unixSocketPath.empty() && unixSocketPath.front() == '/') unixSocketPath.erase(0, 1); // strip "unix://"
+        url = url.substr(hash + 1);
+        if (url.rfind("https://", 0) == 0) {
+            // TLS over a UNIX socket is not meaningful here; s3mmc terminates
+            // mTLS on its TCP side and speaks plain HTTP into the socket.
+            url = "http://" + url.substr(8);
+        }
+    }
+
+    // The query must be appended to the *effective* URL (after unix unwrapping),
+    // otherwise buildUrl would choke on the "unix:" scheme.
+    if (!request.query.empty()) url = buildUrl(url, "", request.query);
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    if (!unixSocketPath.empty()) {
+        curl_easy_setopt(curl, CURLOPT_UNIX_SOCKET_PATH, unixSocketPath.c_str());
+    }
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long)request.timeoutSec);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, (long)request.connectTimeoutSec);
@@ -207,8 +245,9 @@ Response Client::perform(const Request& request, void* curlFile) {
         std::string* data;
         int64_t limit;
     } sinkState{&sink, request.maxResponseBytes};
+    FileSinkState fileState{static_cast<std::FILE*>(curlFile), request.maxResponseBytes, 0};
     if (curlFile) {
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, curlFile);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &fileState);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, fileWriteCallback);
     } else {
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &sinkState);
