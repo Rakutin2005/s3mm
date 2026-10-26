@@ -10,6 +10,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <netdb.h>
 #include <unistd.h>
@@ -30,6 +31,8 @@
 #include "s3mm/common/log.hpp"
 #include "s3mm/common/str.hpp"
 #include "s3mm/common/time.hpp"
+
+#include "configfile.hpp"
 
 namespace s3mm::s3mmc {
 
@@ -92,6 +95,11 @@ bool writeAllFd(int fd, const std::string& data) {
         off += (size_t)n;
     }
     return true;
+}
+
+bool fileExists(const std::string& path) {
+    struct stat st{};
+    return ::stat(path.c_str(), &st) == 0;
 }
 
 /// Stream exactly `len` bytes from socket into file path. Returns bytes written.
@@ -198,6 +206,7 @@ ClusterClient::ClusterClient(Options opts, TlsConfig tls) : opts_(std::move(opts
     if (opts_.spoolDir.empty()) opts_.spoolDir = opts_.runDir + "/spool";
     spoolDir_ = opts_.spoolDir;
     controlPath_ = opts_.runDir + "/" + opts_.nodeId + "/s3mmc.sock";
+    coreSocketPath_ = opts_.coreSocket.empty() ? std::string("/run/s3mm/s3mm.sock") : opts_.coreSocket;
 }
 
 ClusterClient::~ClusterClient() { stop(); }
@@ -252,6 +261,36 @@ std::vector<PeerConfig> ClusterClient::peers() const {
     return out;
 }
 
+ClusterClient::Options ClusterClient::options() const {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    return opts_;
+}
+
+TlsConfig ClusterClient::tlsConfig() const {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    return tls_;
+}
+
+Result<void> ClusterClient::configure(const Options& opts, const TlsConfig& tls) {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    if (running_.load() && (opts.nodeId != opts_.nodeId || opts.runDir != opts_.runDir))
+        return Result<void>::failure("node/run_dir cannot change while s3mmc is running");
+    opts_ = opts;
+    if (opts_.nodeId.empty()) opts_.nodeId = "node-" + std::to_string(::getpid());
+    if (opts_.spoolDir.empty()) opts_.spoolDir = opts_.runDir + "/spool";
+    spoolDir_ = opts_.spoolDir;
+    controlPath_ = opts_.runDir + "/" + opts_.nodeId + "/s3mmc.sock";
+    coreSocketPath_ = opts_.coreSocket.empty() ? std::string("/run/s3mm/s3mm.sock") : opts_.coreSocket;
+    tls_ = tls;
+    if (!tls_.certFile.empty() && !fs::exists(tls_.certFile))
+        return Result<void>::failure("tls cert file not found: " + tls_.certFile);
+    if (!tls_.keyFile.empty() && !fs::exists(tls_.keyFile))
+        return Result<void>::failure("tls key file not found: " + tls_.keyFile);
+    if (!tls_.caFile.empty() && !fs::exists(tls_.caFile))
+        return Result<void>::failure("tls ca file not found: " + tls_.caFile);
+    return Result<void>::success();
+}
+
 void ClusterClient::setLocalInventory(const peer::Inventory& inv) {
     std::lock_guard<std::recursive_mutex> lk(mutex_);
     localInv_ = inv;
@@ -275,6 +314,144 @@ void ClusterClient::setLocalInventory(const peer::Inventory& inv) {
 peer::Inventory ClusterClient::localInventory() const {
     std::lock_guard<std::recursive_mutex> lk(mutex_);
     return localInv_;
+}
+
+// ------------------------------------------- managed-nodes model (local side) --
+
+bool ClusterClient::isManagerOf(const std::string& peerId) const {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    if (peerId.empty()) return false;
+    if (peerId == opts_.nodeId) return true;  // a node is always its own manager
+    for (const auto& m : opts_.managedNodes) {
+        if (m == "*") return true;            // wildcard: every connected peer
+        if (m == peerId) return true;         // CN == cluster id == peer id
+    }
+    return false;
+}
+
+void ClusterClient::setConfigPath(const std::string& path) {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    configPath_ = path;
+}
+
+std::string ClusterClient::configPath() const {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    return configPath_;
+}
+
+void ClusterClient::setSecretsDir(const std::string& dir, const std::string& masterKeyFile) {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    secretsDir_ = dir;
+    masterKeyFile_ = masterKeyFile;
+}
+
+bool ClusterClient::currentConfigText(std::string* text, std::string* error) const {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    if (configPath_.empty()) {
+        *error = "no configuration file is associated with this instance";
+        return false;
+    }
+    auto content = fs::readFile(configPath_);
+    if (!content) {
+        *error = "cannot read '" + configPath_ + "'";
+        return false;
+    }
+    *text = *content;
+    return true;
+}
+
+Result<void> ClusterClient::applyConfigTextFrom(const std::string& text, const std::string& filename,
+                                                const std::string& viaManager) {
+    std::string targetPath;
+    {
+        std::lock_guard<std::recursive_mutex> lk(mutex_);
+        if (!viaManager.empty() && !isManagerOf(viaManager))
+            return Result<void>::failure("remote denied: '" + viaManager +
+                                         "' is not a manager of " + opts_.nodeId);
+        targetPath = configPath_.empty() ? filename : configPath_;
+    }
+    if (targetPath.empty())
+        return Result<void>::failure("no configuration file path known; refusing to apply");
+
+    // Validate the candidate text against a throwaway client first so a bad
+    // patch never overwrites the live file.
+    {
+        ClusterClient probe(options(), tlsConfig());
+        auto vr = applyConfigText(probe, text, targetPath);
+        if (!vr) return Result<void>::failure("config rejected: " + vr.error());
+    }
+
+    // Persist over the live file (atomic), then hot-reload ourselves.
+    std::string dir = fs::dirname(targetPath);
+    if (!dir.empty()) fs::mkdirp(dir);
+    if (!fs::writeFileAtomic(targetPath, text, /*fsyncDir=*/true))
+        return Result<void>::failure("cannot write '" + targetPath + "'");
+    setConfigPath(targetPath);
+    auto ar = applyConfigText(*this, text, targetPath);
+    if (!ar) return Result<void>::failure("applied but reload failed: " + ar.error());
+    LOG_INFO("s3mmc: configuration updated",
+             viaManager.empty() ? "" : (" via manager '" + viaManager + "'"));
+    return Result<void>::success();
+}
+
+// ---------------------------------------------- managed-nodes model (manager) --
+
+Result<std::string> ClusterClient::pullPeerConfig(const std::string& peerId) {
+    return requestConfigFromPeer(peerId);
+}
+
+Result<void> ClusterClient::pushPeerConfig(const std::string& peerId, const std::string& text,
+                                           const std::string& filename) {
+    if (!ensureSession(peerId))
+        return Result<void>::failure("peer '" + peerId + "' not reachable");
+    std::string id = "cfgset-" + std::to_string(++taskSeq_);
+    auto waiter = std::make_shared<PendingReq>();
+    {
+        std::lock_guard<std::mutex> lk(reqMutex_);
+        pendingReqs_[id] = waiter;
+    }
+    Value req = Value::object();
+    req.set("type", Value::str("config_set"));
+    req.set("id", Value::str(id));
+    req.set("from", Value::str(opts_.nodeId));
+    req.set("filename", Value::str(filename));
+    req.set("result", Value::str(text));
+    std::string serr = sendOnPeer(peerId, req);
+    if (!serr.empty()) {
+        std::lock_guard<std::mutex> lk(reqMutex_);
+        pendingReqs_.erase(id);
+        return Result<void>::failure(serr);
+    }
+    std::unique_lock<std::mutex> wl(waiter->mu);
+    bool got = waiter->cv.wait_for(wl, std::chrono::seconds(opts_.pollTimeoutSec),
+                                   [&] { return waiter->done; });
+    if (!got) {
+        std::lock_guard<std::mutex> lk(reqMutex_);
+        pendingReqs_.erase(id);
+        return Result<void>::failure("config_set timed out on '" + peerId + "'");
+    }
+    const Value& reply = waiter->reply;
+    if (reply.getString("status") != "ok")
+        return Result<void>::failure(reply.getString("reason", "config_set refused"));
+    return Result<void>::success();
+}
+
+Result<Value> ClusterClient::pullPeerCredentials(const std::string& peerId,
+                                                 const std::string& clusterFilter) {
+    auto credsR = requestCredsFromPeer(peerId, clusterFilter);
+    if (!credsR) return credsR;
+    // Hand the sealed blocks to our own core for import under our master key.
+    // The core owns sealing/unsealing; s3mmc only transports them.
+    Value req = Value::object();
+    req.set("cmd", Value::str("cluster-import-credentials"));
+    req.set("source_peer", Value::str(peerId));
+    req.set("credentials", *credsR.value().find("credentials"));
+    Value reply;
+    if (!coreCall(req, -1, &reply))
+        return Result<Value>::failure("core rejected credential import");
+    if (const Value* ok = reply.find("ok"); ok && ok->asBool(false))
+        return Result<Value>::success(credsR.value());
+    return Result<Value>::failure(reply.getString("error", "core credential import failed"));
 }
 
 // --------------------------------------------------------------------- start --
@@ -308,6 +485,8 @@ Result<void> ClusterClient::start() {
     }
 
     controlFd_ = bindUnixListener(controlPath_);
+    if (controlFd_ >= 0)
+        threads_.emplace_back([this] { controlLoop(); });
     threads_.emplace_back([this] { dialLoop(); });
     threads_.emplace_back([this] { pollLoop(); });
     LOG_INFO("s3mmc node '", opts_.nodeId, "' started (peer port ", opts_.listenPort, ", run dir ",
@@ -435,8 +614,7 @@ std::string ClusterClient::handleCoreRequestOnSocket(int fd, const std::string& 
             spec.replication = it->second;
         for (const auto& [name, val] : req.headers)
             if (str::startsWith(name, "x-amz-meta-")) spec.meta[name] = val;
-        std::string spoolOut = spool;
-        ServeOutcome out = routeTaskToCluster(clusterId, spec, spoolOut);
+        ServeOutcome out = routeTaskToCluster(clusterId, spec, spool);
         fs::removeFile(spool);
         if (out.ok) return httpReply(200, "ok", "", out.bytesShipped);
         if (out.error.rfind("remote denied", 0) == 0) return httpReply(403, "denied", out.error, 0);
@@ -481,7 +659,7 @@ std::string ClusterClient::handleCoreRequestOnSocket(int fd, const std::string& 
 // ------------------------------------------------------------ task routing ---
 
 ServeOutcome ClusterClient::routeTaskToCluster(const std::string& clusterId, const peer::TaskSpec& specIn,
-                                               std::string& spoolPath) {
+                                               const std::string& spoolPath) {
     ServeOutcome out;
     peer::TaskSpec spec = specIn;
     spec.trail.push_back(opts_.nodeId);
@@ -648,6 +826,15 @@ std::vector<Value> ClusterClient::handlePeerFrame(const std::string& peerIdHint,
     if (type == "task_result") { onTaskResult(peerId, frame); return {}; }
     if (type == "object_req") return {onObjectReq(peerId, frame)};
     if (type == "object_data") { onObjectData(peerId, frame, ch); return {}; }
+    // managed-nodes model frames: config/credential management. Replies to
+    // our own outbound requests are matched by "ref" and never guarded here.
+    if (type == "config_get") return {onConfigGet(peerId, frame)};
+    if (type == "config_set") return {onConfigSet(peerId, frame)};
+    if (type == "cred_request") return {onCredRequest(peerId, frame)};
+    if (type == "config_response" || type == "config_ack" || type == "cred_response") {
+        onManagerReply(peerId, frame);
+        return {};
+    }
     if (type == "ping") {
         Value pong = Value::object();
         pong.set("type", Value::str("pong"));
@@ -788,7 +975,7 @@ Value ClusterClient::onTask(const std::string& peerId, const Value& frame) {
             // wait for object_data to land (bounded)
             auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(opts_.coreTimeoutSec);
             std::unique_lock<std::mutex> lk(waitMutex_);
-            bool arrived = waitCv_.wait_until(lk, deadline, [&] { return fs::exists(spool); });
+            bool arrived = waitCv_.wait_until(lk, deadline, [&] { return fileExists(spool); });
             if (arrived) haveData = true;
             else {
                 res.status = "failed";
@@ -799,8 +986,7 @@ Value ClusterClient::onTask(const std::string& peerId, const Value& frame) {
 
     if (res.status.empty()) {
         // Now act as the destination node: serve locally or forward onward.
-        std::string spoolArg = spool;
-        ServeOutcome out = routeTaskToCluster(destCluster, spec, spoolArg);
+        ServeOutcome out = routeTaskToCluster(destCluster, spec, spool);
         res.status = out.ok ? "ok" : (out.error.rfind("remote denied", 0) == 0 ? "denied" : "failed");
         res.reason = out.ok ? "" : out.error;
         res.bytesShipped = out.bytesShipped;
@@ -901,7 +1087,219 @@ void ClusterClient::onObjectData(const std::string& peerId, const Value& frame, 
     waitCv_.notify_all();
 }
 
+// ---------------------------------------------------- manager / config frames ---
+//
+// These implement the managed-nodes model: a peer whose authenticated mTLS CN
+// appears in our `managed` list (or when the list is "*") may read/patch our
+// live s3mmc.conf and pull S3 credentials over the cluster channel. Identity
+// is the certificate CN — there are no roles, only this per-node delegation
+// matrix. A non-manager request is answered with status "denied".
+
+Value ClusterClient::makeManagerReply(const std::string& type, const Value& frame,
+                                      bool ok, const std::string& status,
+                                      const std::string& reason, const Value* result) {
+    Value f = Value::object();
+    f.set("type", Value::str(type));
+    f.set("from", Value::str(opts_.nodeId));
+    f.set("ref", Value::str(frame.getString("id")));
+    f.set("ok", Value::boolean(ok));
+    f.set("status", Value::str(status));
+    if (!reason.empty()) f.set("reason", Value::str(reason));
+    if (result) f.set("result", *result);
+    return f;
+}
+
+Value ClusterClient::onConfigGet(const std::string& peerId, const Value& frame) {
+    if (!isManagerOf(peerId))
+        return makeManagerReply("config_response", frame, false, "denied",
+                                "remote denied: not a manager of " + opts_.nodeId, nullptr);
+    std::string text, err;
+    if (!currentConfigText(&text, &err))
+        return makeManagerReply("config_response", frame, false, "failed", err, nullptr);
+    Value res = Value::object();
+    res.set("filename", Value::str(configPath_));
+    res.set("text", Value::str(text));
+    return makeManagerReply("config_response", frame, true, "ok", "", &res);
+}
+
+Value ClusterClient::onConfigSet(const std::string& peerId, const Value& frame) {
+    if (!isManagerOf(peerId))
+        return makeManagerReply("config_ack", frame, false, "denied",
+                                "remote denied: not a manager of " + opts_.nodeId, nullptr);
+    const Value* res = frame.find("result");
+    if (!res || !res->isString())
+        return makeManagerReply("config_ack", frame, false, "denied", "malformed config_set", nullptr);
+    auto r = applyConfigTextFrom(res->asString(), frame.getString("filename"), peerId);
+    if (!r)
+        return makeManagerReply("config_ack", frame, false, "failed", r.error(), nullptr);
+    return makeManagerReply("config_ack", frame, true, "ok", "", nullptr);
+}
+
+Value ClusterClient::onCredRequest(const std::string& peerId, const Value& frame) {
+    bool allowed = isManagerOf(peerId) || opts_.exposeCredentials;
+    if (!allowed)
+        return makeManagerReply("cred_response", frame, false, "denied",
+                                "remote denied: credential export not permitted for '" +
+                                    peerId + "'", nullptr);
+    // Collect local sealed secret material. The core owns the authoritative
+    // credential set; we hand over the raw sealed PEM blocks from secretsDir so
+    // the manager can re-seal them under its own passphrase. Nothing plaintext
+    // ever leaves this node.
+    std::string filter = frame.getString("cluster");
+    Value arr = Value::array();
+    if (fs::exists(secretsDir_)) {
+        for (const auto& name : fs::listDir(secretsDir_)) {
+            if (!filter.empty() && name != filter) continue;
+            auto content = fs::readFile(fs::joinPath(secretsDir_, name));
+            if (!content) continue;
+            Value item = Value::object();
+            item.set("name", Value::str(name));
+            item.set("sealed", Value::str(*content));
+            arr.push(item);
+        }
+    }
+    Value res = Value::object();
+    res.set("credentials", arr);
+    return makeManagerReply("cred_response", frame, true, "ok", "", &res);
+}
+
+void ClusterClient::onManagerReply(const std::string& peerId, const Value& frame) {
+    (void)peerId;
+    std::string id = frame.getString("ref");
+    std::shared_ptr<PendingReq> waiter;
+    {
+        std::lock_guard<std::mutex> lk(reqMutex_);
+        auto it = pendingReqs_.find(id);
+        if (it == pendingReqs_.end()) return;
+        waiter = it->second;
+        pendingReqs_.erase(it);
+    }
+    {
+        std::lock_guard<std::mutex> lk(waiter->mu);
+        waiter->reply = frame;
+        waiter->done = true;
+    }
+    waiter->cv.notify_all();
+}
+
+Result<std::string> ClusterClient::requestConfigFromPeer(const std::string& peerId) {
+    if (!ensureSession(peerId))
+        return Result<std::string>::failure("peer '" + peerId + "' not reachable");
+    std::string id = "cfgget-" + std::to_string(++taskSeq_);
+    auto waiter = std::make_shared<PendingReq>();
+    {
+        std::lock_guard<std::mutex> lk(reqMutex_);
+        pendingReqs_[id] = waiter;
+    }
+    Value req = Value::object();
+    req.set("type", Value::str("config_get"));
+    req.set("id", Value::str(id));
+    req.set("from", Value::str(opts_.nodeId));
+    std::string serr = sendOnPeer(peerId, req);
+    if (!serr.empty()) {
+        std::lock_guard<std::mutex> lk(reqMutex_);
+        pendingReqs_.erase(id);
+        return Result<std::string>::failure(serr);
+    }
+    std::unique_lock<std::mutex> wl(waiter->mu);
+    bool got = waiter->cv.wait_for(wl, std::chrono::seconds(opts_.pollTimeoutSec),
+                                   [&] { return waiter->done; });
+    if (!got) {
+        std::lock_guard<std::mutex> lk(reqMutex_);
+        pendingReqs_.erase(id);
+        return Result<std::string>::failure("config_get timed out on '" + peerId + "'");
+    }
+    const Value& reply = waiter->reply;
+    std::string status = reply.getString("status");
+    if (status != "ok") {
+        std::string reason = reply.getString("reason", "no reason given");
+        return Result<std::string>::failure(reason.empty() ? "config_get failed" : reason);
+    }
+    const Value* res = reply.find("result");
+    if (!res || !res->isString())
+        return Result<std::string>::failure("config_get returned no text");
+    return Result<std::string>::success(res->asString());
+}
+
+Result<Value> ClusterClient::requestCredsFromPeer(const std::string& peerId,
+                                                  const std::string& clusterFilter) {
+    if (!ensureSession(peerId))
+        return Result<Value>::failure("peer '" + peerId + "' not reachable");
+    std::string id = "creq-" + std::to_string(++taskSeq_);
+    auto waiter = std::make_shared<PendingReq>();
+    {
+        std::lock_guard<std::mutex> lk(reqMutex_);
+        pendingReqs_[id] = waiter;
+    }
+    Value req = Value::object();
+    req.set("type", Value::str("cred_request"));
+    req.set("id", Value::str(id));
+    req.set("from", Value::str(opts_.nodeId));
+    if (!clusterFilter.empty()) req.set("cluster", Value::str(clusterFilter));
+    std::string serr = sendOnPeer(peerId, req);
+    if (!serr.empty()) {
+        std::lock_guard<std::mutex> lk(reqMutex_);
+        pendingReqs_.erase(id);
+        return Result<Value>::failure(serr);
+    }
+    std::unique_lock<std::mutex> wl(waiter->mu);
+    bool got = waiter->cv.wait_for(wl, std::chrono::seconds(opts_.pollTimeoutSec),
+                                   [&] { return waiter->done; });
+    if (!got) {
+        std::lock_guard<std::mutex> lk(reqMutex_);
+        pendingReqs_.erase(id);
+        return Result<Value>::failure("cred_request timed out on '" + peerId + "'");
+    }
+    const Value& reply = waiter->reply;
+    if (reply.getString("status") != "ok") {
+        std::string reason = reply.getString("reason", "credential request refused");
+        return Result<Value>::failure(reason);
+    }
+    const Value* res = reply.find("result");
+    if (!res) return Result<Value>::failure("cred_response without payload");
+    return Result<Value>::success(*res);
+}
+
 // ------------------------------------------------------------------- loops ---
+
+void ClusterClient::controlLoop() {
+    while (running_.load()) {
+        pollfd p{controlFd_, POLLIN, 0};
+        if (::poll(&p, 1, 500) <= 0) continue;
+        int client = ::accept(controlFd_, nullptr, nullptr);
+        if (client < 0) continue;
+        std::thread([this, client] {
+            std::string line;
+            if (!readLineFd(client, line, 5000)) { ::close(client); return; }
+            std::string err;
+            auto req = Value::parseJson(line, &err);
+            Value reply = Value::object();
+            if (!err.empty() || !req.isObject()) {
+                reply.set("ok", Value::boolean(false));
+                reply.set("error", Value::str("malformed control request"));
+            } else if (req.getString("cmd") == "status") {
+                reply = statusValue();
+                reply.set("ok", Value::boolean(true));
+            } else if (req.getString("cmd") == "routes") {
+                reply = Value::object();
+                reply.set("ok", Value::boolean(true));
+                Value arr = Value::array();
+                for (const auto& [c, hop] : routes()) {
+                    Value rv = Value::object();
+                    rv.set("cluster", Value::str(c));
+                    rv.set("via", Value::str(hop));
+                    arr.push(rv);
+                }
+                reply.set("routes", arr);
+            } else {
+                reply.set("ok", Value::boolean(false));
+                reply.set("error", Value::str("unknown command: " + req.getString("cmd")));
+            }
+            writeAllFd(client, reply.toJson() + "\n");
+            ::close(client);
+        }).detach();
+    }
+}
 
 void ClusterClient::acceptLoop() {
     while (running_.load()) {

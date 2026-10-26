@@ -30,8 +30,10 @@ Exit codes: `0` success, `1` error, `2` usage error.
   `rule edit <policy> <ref> <rule>` / `rule rm <policy> <ref>`
 - `policy list|show|add|edit|rm ...` (shorthand)
 - `replication list|show`, `replication period <name> <dur>`,
-  `replication queue|route [name]`, `replication scan|flush [name]`
+  `replication queue [name]`, `replication scan|flush [name]`
 - `stat [replica]`, `queues [replica]`, `routes [replica] [--limit N]`
+  (`routes` shows the policy-routing decisions of the local engine — success/
+  denied/warning outcomes; cluster mesh routing lives in s3mmc, not here)
 - `scan [replica] [--async|--force]`, `flush [replica]`
 - `sync-accounts <replication> [--apply] [--prune]` (dry-run unless `--apply`).
   Without `--prune` accounts are only created/updated; `--prune` also removes

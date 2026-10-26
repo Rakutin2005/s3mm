@@ -16,6 +16,11 @@
 //   task_result  — verdict ok|denied|failed, returned hop-by-hop to origin
 //   object_req   — "send me this range" (data reversal over inbound channel)
 //   object_data  — response to object_req / task payload spool reference
+//   config_get   — manager asks a peer for its current s3mmc config text
+//   config_set   — manager pushes a new config text to a managed peer
+//   cred_request — pull S3 credentials from a peer (managers always; other
+//                  peers only when the target sets expose_credentials on)
+//   cred_response — sealed credential blocks, re-sealed for the requester
 //   ping/pong    — liveness
 #include <cstdint>
 #include <map>

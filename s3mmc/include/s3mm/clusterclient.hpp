@@ -85,13 +85,21 @@ public:
         std::string nodeId;                 // stable identity (cert CN by default)
         std::string runDir = "/var/run/s3mmc";
         std::string spoolDir;               // default: runDir/spool
+        std::string coreSocket;             // s3mmd control socket (default /run/s3mm.sock)
         std::string listenAddress = "0.0.0.0";
         int listenPort = 9443;              // peer mTLS port; 0 => no listener
-        std::string pollModel = "both";     // push | pull | both
+        std::string pollModel = "both";     // push | pull | both (both == no-op alias)
         int64_t pollIntervalSec = 60;       // inventory exchange cadence
         int64_t pollTimeoutSec = 15;
         int64_t coreTimeoutSec = 300;       // GET-wait budget towards local core
         uint64_t spoolThresholdBytes = 1ull << 20;
+        /// Managers of this node ("*" | list of peer ids/CNs | empty = none).
+        /// A manager may patch our config and pull credentials over the cluster
+        /// channel. Identity is the CN of the peer's mTLS certificate.
+        std::vector<std::string> managedNodes;
+        /// When true, ANY connected peer may request S3 credentials from us
+        /// (sealed for its own passphrase). Managers may always do so.
+        bool exposeCredentials = false;
     };
 
     explicit ClusterClient(Options opts, TlsConfig tls);
@@ -102,6 +110,44 @@ public:
     Result<void> addPeer(PeerConfig p);
     Result<void> removePeer(const std::string& idOrAddress);
     std::vector<PeerConfig> peers() const;
+
+    Options options() const;
+    TlsConfig tlsConfig() const;
+    /// Reconfigure before start(). Changing nodeId/runDir after start is an
+    /// error; poll model / intervals / TLS material may be updated live.
+    Result<void> configure(const Options& opts, const TlsConfig& tls);
+
+    // ---- cluster management (managed-nodes model) ---------------------------
+    /// True when `peerId` (CN of its mTLS certificate == peer id) is allowed
+    /// to manage this node: patch our config, pull credentials. "*" in the
+    /// managed list matches every connected peer; a peer is always its own
+    /// manager. There are no roles — this is a per-node delegation matrix.
+    bool isManagerOf(const std::string& peerId) const;
+    /// Path of the live configuration file once known (set by main()/tests).
+    void setConfigPath(const std::string& path);
+    std::string configPath() const;
+    /// Directory holding sealed credential PEM files (default /etc/s3mm/secrets)
+    /// and the master-key file used to re-seal them for a manager.
+    void setSecretsDir(const std::string& dir, const std::string& masterKeyFile = {});
+    /// Current s3mmc.conf text read from disk (empty + false on failure).
+    bool currentConfigText(std::string* text, std::string* error) const;
+    /// Validate `text` and persist it over the live config file, then apply
+    /// it to this running instance (hot reload of peers/TLS/scalars).
+    /// Refused unless invoked via a channel authenticated as our manager
+    /// (`viaManager` carries the requester's peer id; empty = local CLI).
+    Result<void> applyConfigTextFrom(const std::string& text, const std::string& filename,
+                                     const std::string& viaManager);
+
+    // ---- manager-side operations (run on THIS node acting as a manager) -----
+    /// Pull the live s3mmc.conf text of a managed peer over the cluster channel.
+    Result<std::string> pullPeerConfig(const std::string& peerId);
+    /// Push a new config text to a managed peer (it validates, persists and
+    /// hot-reloads it; refuses us unless we are in its `managed` list).
+    Result<void> pushPeerConfig(const std::string& peerId, const std::string& text,
+                                const std::string& filename);
+    /// Pull sealed credentials from a peer and re-import them into our own core
+    /// registry via the control socket (the core owns sealing under our key).
+    Result<Value> pullPeerCredentials(const std::string& peerId, const std::string& clusterFilter);
 
     /// Local inventory reported by s3mmd over the control connection (or set
     /// directly in tests). Bumps our revision and pushes when poll model says so.
@@ -118,14 +164,15 @@ public:
     // ---- core-facing service --------------------------------------------------
     /// Serve one HTTP-over-UNIX request arriving on remote[clusterId]'s socket.
     /// Reads the request line + headers (and PUT body) from `fd`, routes/serves
-    /// the task and writes the response back. Used by accept threads and tests.
-    void handleCoreRequestOnSocket(int fd, const std::string& clusterId);
+    /// the task and writes the response back. Returns the response head to
+    /// write (empty when the handler already streamed everything).
+    std::string handleCoreRequestOnSocket(int fd, const std::string& clusterId);
 
     /// Blocking: route a replication task towards `clusterId` — serve it via
     /// the local core when the cluster is reachable here, otherwise forward to
     /// the next hop and wait for the verdict travelling back along the path.
     ServeOutcome routeTaskToCluster(const std::string& clusterId, const peer::TaskSpec& spec,
-                                    std::string spoolPath);
+                                    const std::string& spoolPath);
 
     // ---- frame handling (peer threads call in) --------------------------------
     /// Process one inbound frame on the session with `peerId`. Returns frames
@@ -154,6 +201,7 @@ private:
         bool connected = false;
         std::string direction;
         std::shared_ptr<Channel> channel;   // current session (may be null)
+        std::string peerCN;                 // authenticated CN of the mTLS session
         int64_t sinceSec = 0;
         int64_t lastSeenSec = 0;
         int64_t reconnects = 0;
@@ -171,14 +219,24 @@ private:
         ServeOutcome outcome;
     };
 
+    /// Pending manager request awaiting a reply frame (config_get, cred_request).
+    struct PendingReq {
+        std::mutex mu;
+        std::condition_variable cv;
+        bool done = false;
+        Value reply;                        // response frame payload ("result" member)
+    };
+
     // -- internals
     void acceptLoop();                       // peer mTLS listener
     void dialLoop();                         // maintain outbound sessions
     void pollLoop();                         // inventory exchange cadence
     void unixAcceptLoop(int fd, std::string clusterId); // remote[id] sockets
+    void controlLoop();                                 // s3mmc.sock (status CLI)
     void sessionLoop(std::shared_ptr<Channel> ch, std::string peerIdHint, bool dialed);
     bool ensureSession(const std::string& peerId);      // blocking dial + hello
     void dropSession(const std::string& peerId, const std::string& reason);
+    void dropSessionByChannel(const std::shared_ptr<Channel>& ch, const std::string& reason);
 
     std::string sendOnPeer(const std::string& peerId, const Value& frame);
     Value buildHelloFrame();
@@ -194,8 +252,22 @@ private:
     void onTaskResult(const std::string& peerId, const Value& frame);
     Value onObjectReq(const std::string& peerId, const Value& frame);
     void onObjectData(const std::string& peerId, const Value& frame, std::shared_ptr<Channel> ch);
+    Value onConfigGet(const std::string& peerId, const Value& frame);
+    Value onConfigSet(const std::string& peerId, const Value& frame);
+    Value onCredRequest(const std::string& peerId, const Value& frame);
+    void onManagerReply(const std::string& peerId, const Value& frame);
+    static Value makeManagerReply(const std::string& type, const Value& frame,
+                                  bool ok, const std::string& status,
+                                  const std::string& reason, const Value* result);
+
+    // manager-side outbound requests (blocking; reply arrives on the session)
+    Result<std::string> requestConfigFromPeer(const std::string& peerId);
+    Result<Value> requestCredsFromPeer(const std::string& peerId, const std::string& clusterFilter);
+
+    bool ownsClusterLocked(const std::string& id) const;
 
     // core helpers
+    bool coreCall(const Value& request, int extraFd, Value* reply);
     bool coreGetToFile(const std::string& bucket, const std::string& key, const std::string& path,
                        std::string* error);
     bool corePutFromFile(const std::string& bucket, const std::string& key, const std::string& path,
@@ -206,6 +278,10 @@ private:
     TlsConfig tls_;
     std::string spoolDir_;
     std::string controlPath_;
+    std::string coreSocketPath_;      // s3mmd control socket used by coreCall
+    std::string configPath_;          // live s3mmc.conf (for manager-side patches)
+    std::string secretsDir_ = "/etc/s3mm/secrets";  // sealed credential material
+    std::string masterKeyFile_;       // file holding the sealing passphrase
 
     mutable std::recursive_mutex mutex_;
     std::map<std::string, PeerRuntime> peers_;          // by id
@@ -218,6 +294,16 @@ private:
     std::map<std::string, std::string> taskNextHop_;    // taskId -> peer we forwarded to
     std::map<std::string, std::string> taskSender_;     // taskId -> peer that sent it to us
     std::map<std::string, std::shared_ptr<InflightServe>> inflight_; // "bkt\nkey" -> waiter
+
+    // verdict rendez-vous: routeTaskToCluster waits here for onTaskResult
+    std::mutex waitMutex_;
+    std::condition_variable waitCv_;
+    std::map<std::string, peer::TaskResult> verdicts_;   // taskId -> result
+
+    /// Pending manager requests awaiting a reply frame (id -> waiter).
+    std::mutex reqMutex_;
+    std::condition_variable reqCv_;
+    std::map<std::string, std::shared_ptr<PendingReq>> pendingReqs_;
 
     // sockets
     int peerListenFd_ = -1;

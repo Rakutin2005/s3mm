@@ -67,4 +67,10 @@ Result<std::shared_ptr<Channel>> makeTlsChannel(int fd, bool clientRole,
                                                 const std::string& keyFile,
                                                 const std::string& caFile);
 
+/// Common Name of the counterparty certificate of a TLS channel established
+/// via makeTlsChannel(); empty string for non-TLS channels or when no peer
+/// certificate was presented. Used as the node identity on the cluster
+/// channel (CN == cluster id == peer id) and for managed-node checks.
+std::string tlsPeerCommonName(const std::shared_ptr<Channel>& ch);
+
 } // namespace s3mm::s3mmc

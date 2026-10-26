@@ -4,6 +4,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <openssl/x509.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
@@ -13,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <map>
 #include <mutex>
 
 #include "s3mm/common/crypto.hpp"
@@ -364,6 +366,29 @@ public:
 private:
     int fd_ = -1;
     SSL* ssl_ = nullptr;
+
+public:
+    /// CN of the counterparty certificate (empty when absent).
+    std::string peerCommonName() const {
+        if (!ssl_) return {};
+        X509* cert = SSL_get1_peer_certificate(ssl_);
+        if (!cert) return {};
+        std::string cn;
+        X509_NAME* subj = X509_get_subject_name(cert);
+        int idx = X509_NAME_get_index_by_NID(subj, NID_commonName, -1);
+        if (idx >= 0) {
+            X509_NAME_ENTRY* ent = X509_NAME_get_entry(subj, idx);
+            ASN1_STRING* data = X509_NAME_ENTRY_get_data(ent);
+            unsigned char* utf8 = nullptr;
+            int len = ASN1_STRING_to_UTF8(&utf8, data);
+            if (len >= 0 && utf8) {
+                cn.assign(reinterpret_cast<const char*>(utf8), (size_t)len);
+                OPENSSL_free(utf8);
+            }
+        }
+        X509_free(cert);
+        return cn;
+    }
 };
 
 } // namespace
@@ -374,29 +399,46 @@ Result<std::shared_ptr<Channel>> makeUnixChannel(int fd) {
 
 Result<std::shared_ptr<Channel>> makeTlsChannel(int fd, bool clientRole, const std::string& certFile,
                                                 const std::string& keyFile, const std::string& caFile) {
-    static std::once_flag ctxOnce;
-    static SSL_CTX* clientCtx = nullptr;
-    static SSL_CTX* serverCtx = nullptr;
-    std::call_once(ctxOnce, [] {
-        clientCtx = SSL_CTX_new(TLS_client_method());
-        serverCtx = SSL_CTX_new(TLS_server_method());
-    });
-    SSL_CTX* ctx = clientRole ? clientCtx : serverCtx;
-    if (!ctx) return Result<std::shared_ptr<Channel>>::failure("SSL_CTX_new failed");
-
-    if (!certFile.empty() && !keyFile.empty()) {
-        if (SSL_CTX_use_certificate_file(ctx, certFile.c_str(), SSL_FILETYPE_PEM) != 1)
-            return Result<std::shared_ptr<Channel>>::failure("client cert load failed: " + certFile);
-        if (SSL_CTX_use_PrivateKey_file(ctx, keyFile.c_str(), SSL_FILETYPE_PEM) != 1)
-            return Result<std::shared_ptr<Channel>>::failure("client key load failed: " + keyFile);
+    // Per-material contexts: a static shared ctx would silently reuse the
+    // first-loaded cert/CA when several ClusterClient instances (tests) or
+    // live TLS reconfiguration are involved.
+    static std::mutex ctxMutex;
+    static std::map<std::string, SSL_CTX*> ctxCache;
+    std::string key = (clientRole ? "c|" : "s|") + certFile + "|" + keyFile + "|" + caFile;
+    SSL_CTX* ctx = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(ctxMutex);
+        auto it = ctxCache.find(key);
+        if (it != ctxCache.end()) ctx = it->second;
     }
-    if (!caFile.empty()) {
-        if (SSL_CTX_load_verify_locations(ctx, caFile.c_str(), nullptr) != 1)
-            return Result<std::shared_ptr<Channel>>::failure("CA load failed: " + caFile);
-        // mTLS: always verify the counterparty against our CA.
-        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nullptr);
-    } else {
-        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
+    if (!ctx) {
+        SSL_CTX* fresh = SSL_CTX_new(clientRole ? TLS_client_method() : TLS_server_method());
+        if (!fresh) return Result<std::shared_ptr<Channel>>::failure("SSL_CTX_new failed");
+        bool ok = true;
+        if (!certFile.empty() && !keyFile.empty()) {
+            ok &= SSL_CTX_use_certificate_file(fresh, certFile.c_str(), SSL_FILETYPE_PEM) == 1;
+            ok &= SSL_CTX_use_PrivateKey_file(fresh, keyFile.c_str(), SSL_FILETYPE_PEM) == 1;
+            ok &= SSL_CTX_check_private_key(fresh) == 1;
+        }
+        if (ok && !caFile.empty()) {
+            ok = SSL_CTX_load_verify_locations(fresh, caFile.c_str(), nullptr) == 1;
+            // mTLS: always verify the counterparty against our CA.
+            SSL_CTX_set_verify(fresh, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nullptr);
+        } else if (ok) {
+            SSL_CTX_set_verify(fresh, SSL_VERIFY_NONE, nullptr);
+        }
+        if (!ok) {
+            SSL_CTX_free(fresh);
+            return Result<std::shared_ptr<Channel>>::failure(
+                "TLS context setup failed (cert=" + certFile + " key=" + keyFile + " ca=" + caFile + ")");
+        }
+        ctx = fresh;
+        std::lock_guard<std::mutex> lk(ctxMutex);
+        auto res = ctxCache.emplace(key, ctx);
+        if (!res.second) {           // lost a race — keep the winner, free ours
+            SSL_CTX_free(ctx);
+            ctx = res.first->second;
+        }
     }
 
     SSL* ssl = SSL_new(ctx);
@@ -412,6 +454,11 @@ Result<std::shared_ptr<Channel>> makeTlsChannel(int fd, bool clientRole, const s
         return Result<std::shared_ptr<Channel>>::failure(std::string("TLS handshake failed: ") + eb);
     }
     return Result<std::shared_ptr<Channel>>(std::make_shared<TlsChannel>(fd, ssl));
+}
+
+std::string tlsPeerCommonName(const std::shared_ptr<Channel>& ch) {
+    auto* tls = dynamic_cast<TlsChannel*>(ch.get());
+    return tls ? tls->peerCommonName() : std::string();
 }
 
 } // namespace s3mm::s3mmc
