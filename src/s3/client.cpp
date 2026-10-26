@@ -86,6 +86,24 @@ Client::Attempt Client::prepare(const std::string& method, const std::string& re
     req.timeoutSec = options_.timeoutSec;
     req.connectTimeoutSec = options_.connectTimeoutSec;
     req.maxResponseBytes = 64 * 1024 * 1024;
+    // Range requests fetch object data: the response may legitimately be as
+    // large as the requested slice, so lift the default control-plane cap to
+    // cover it (still bounded by the requested length).
+    if (!range.empty()) {
+        // parse "bytes=OFF-OFFLEN" style ranges to derive the expected size
+        auto dash = range.find('-');
+        if (dash != std::string::npos && dash + 1 < range.size()) {
+            auto fromEnd = str::parseInt64(std::string_view(range).substr(dash + 1));
+            auto fromStart = str::parseInt64(std::string_view(range).substr(6, dash - 6)); // after "bytes="
+            if (fromEnd && fromStart && *fromEnd >= *fromStart) {
+                int64_t len = *fromEnd - *fromStart + 1;
+                if (len > req.maxResponseBytes)
+                    req.maxResponseBytes = len + 64 * 1024; // margin for chunked lies
+            } else if (fromEnd && *fromEnd > req.maxResponseBytes) {
+                req.maxResponseBytes = *fromEnd + 64 * 1024;
+            }
+        }
+    }
     for (const auto& [k, v] : extraHeaders) req.headers[k] = v;
     attempt.request = std::move(req);
     return attempt;

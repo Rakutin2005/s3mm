@@ -96,7 +96,17 @@ std::string normKind(std::string k) {
     if (k == "policies" || k == "bundles") return "policy";
     if (k == "rules") return "rule";
     if (k == "settings") return "settings";
+    // Kinds owned by the s3mmc cluster client — kept out of the core registry.
+    if (k == "peer" || k == "peers" || k == "node" || k == "nodes" ||
+        k == "mesh" || k == "mtls")
+        return k;
     return k;
+}
+
+/// Mutation kinds that belong to the cluster client (s3mmc), not to s3mmd.
+bool isClusterKind(const std::string& kind) {
+    return kind == "peer" || kind == "peers" || kind == "node" || kind == "nodes" ||
+           kind == "mesh" || kind == "mtls";
 }
 
 policy::Action parseActionText(const std::string& text) {
@@ -272,6 +282,10 @@ Value mutateEntity(Registry& r, const std::string& cmd, const std::string& kindR
 
     std::string kind = normKind(kindRaw);
     if (kind.empty()) throw UsageError(cmd + ": 'kind' required");
+    if (isClusterKind(kind))
+        throw UsageError(
+            cmd + " " + kind + ": cluster membership is managed by the s3mmc "
+            "cluster client (s3mmc.conf), not by the s3mmd registry");
     std::string name = nameIn;
     if (name.empty()) name = fstr(fields, "name");
     if (name.empty() && kind != "settings") throw UsageError(cmd + ": 'name' required");

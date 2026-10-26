@@ -162,7 +162,6 @@ Value buildRequest(const std::string& cmd, const std::vector<std::string>& rest)
             return req;
         }
         if (sub == "queue") return buildRequest("queues", tail);
-        if (sub == "route") return buildRequest("routes", tail);
         if (sub == "scan") return buildRequest("scan", tail);
         if (sub == "flush") return buildRequest("flush", tail);
         throw UsageError("replication: unknown subcommand '" + sub + "'");
@@ -206,19 +205,6 @@ Value buildRequest(const std::string& cmd, const std::vector<std::string>& rest)
         req.set("replication", Value::str(a.positional[0]));
         req.set("dry_run", Value::boolean(!optFlag(a, "apply")));
         if (optFlag(a, "prune")) req.set("prune", Value::boolean(true));
-        return req;
-    }
-
-    if (cmd == "peer") {
-        Args a = parseArgs(rest, false);
-        std::string action = a.positional.empty() ? "list" : a.positional[0];
-        Value req = Value::object();
-        req.set("cmd", Value::str(cmd));
-        req.set("action", Value::str(action));
-        if (action == "add" || action == "remove") {
-            if (a.positional.size() < 2) throw UsageError("peer " + action + ": address required");
-            req.set("address", Value::str(a.positional[1]));
-        }
         return req;
     }
 
@@ -322,6 +308,19 @@ Value buildRequest(const std::string& cmd, const std::vector<std::string>& rest)
             throw UsageError("rule rm: usage: s3mm rule rm <policy> <ref>");
         req.set("ref", Value::str(a.positional[1]));
         return req;
+    }
+
+    // Commands that belong to the cluster client, not to s3mmd. Give a hint
+    // instead of a bare "unknown command".
+    static const char* kClusterVerbs[] = {"peer",  "peers", "cluster", "clusters-mgr",
+                                          "node",  "nodes", "mesh",    "inventory"};
+    for (const char* v : kClusterVerbs) {
+        if (cmd == v)
+            throw UsageError(
+                "'" + cmd + "' is not an s3mm command: clustering (peers, mTLS, "
+                "inventory exchange, routes between s3mmd instances) is handled by "
+                "the separate cluster client — run 's3mmc -d' on each node and edit "
+                "s3mmc.conf (or use the s3mmc management tool)");
     }
 
     throw UsageError("unknown command '" + cmd + "'; try 's3mm --help'");
@@ -434,8 +433,7 @@ Commands:
   policy list|show|add|edit|rm    shorthand for list/show/add/edit/rm kind=policy
   replication list|show           list/show replications
   replication period <name> <dur> set the batching period (e.g. 10m)
-  replication queue|route [name]  alias for queues/routes
-  replication scan|flush [name]   alias for scan/flush
+  replication queue|scan|flush [name]  aliases for queues/scan/flush
 
   stat [replica]                  replication counters
   queues [replica]                queue depths

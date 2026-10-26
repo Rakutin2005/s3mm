@@ -332,11 +332,14 @@ TargetGroupPtr Engine::resolveTarget(RepState& st, const Candidate& candidate) {
         if (auto s3target = std::dynamic_pointer_cast<S3Target>(group)) s3target->bind(st.destination, st.source.get());
         return group;
     }
+    // Unknown target: never silently ship into a basket the operator did not name.
+    // denied/warning keep their explicit routes (quarantine must stay reachable);
+    // success-side unknowns are dropped to the denied route and reported.
     LOG_WARN("unknown target '", candidate.target, "' for replication '", candidate.replication,
-             "': falling back to the outcome route");
-    if (candidate.outcome == "denied") return st.routes.denied;
-    if (candidate.outcome == "warning") return st.routes.warning;
-    return st.routes.success;
+             "': refusing to fall back to the success route");
+    if (candidate.outcome == "warning" && st.routes.warning) return st.routes.warning;
+    if (st.routes.denied) return st.routes.denied;
+    return nullptr; // no denied route -> deliver() reports "no target resolved"
 }
 
 Result<void> Engine::deliver(RepState& st, Candidate& candidate) {

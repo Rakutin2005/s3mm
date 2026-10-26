@@ -75,9 +75,12 @@ Result<void> Registry::parseSettings(const Node& node) {
                 settings_.scanEverySec = units::parseDurationSeconds(c.value("every", "5m"));
                 settings_.bucketScanEverySec = units::parseDurationSeconds(c.value("bucket_every", "0"));
             } else if (c.name == "include" || c.name == "cluster" || c.name == "credential" || c.name == "policy" ||
-                       c.name == "replication" || c.name == "target" || c.name == "s3mmws" || c.name == "wscluster" ||
-                       c.name == "peer" || c.name == "peers" || c.name == "mtls") {
+                       c.name == "replication" || c.name == "target" || c.name == "s3mmws" || c.name == "wscluster") {
                 continue; // handled elsewhere
+            } else if (c.name == "peer" || c.name == "peers" || c.name == "mtls") {
+                return Result<void>::failure(
+                    loc(c) + ": '" + c.name + "' belongs to the s3mmc cluster client configuration "
+                               "(s3mmc.conf), not to s3mmd");
             } else {
                 return Result<void>::failure(loc(c) + ": unknown directive '" + c.name + "' in s3mm block");
             }

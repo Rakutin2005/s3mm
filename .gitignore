@@ -1,2 +1,10 @@
 build/
-*cache*
+build-test/
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.exe
+*.out
+*.bin

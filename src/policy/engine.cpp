@@ -77,9 +77,17 @@ Decision Engine::evaluate(const Bundle& bundle, Category category, const Context
     d.actions.push_back(def);
     applyActionRouting(def, bundle.routes, replicationName, d);
     if (d.outcome.empty()) {
-        // default action pass/redirect without target: fall back to accept
-        d.outcome = "success";
-        d.target = bundle.routes.success.empty() ? replicationName + "-rqueue" : bundle.routes.success;
+        // default action pass without target: fall back to accept.
+        // A `redirect` with an empty positional is a rule-authoring error —
+        // never silently reroute it into the success basket.
+        const bool redirectNoTarget = def.name == "redirect" && def.positional.empty();
+        if (redirectNoTarget) {
+            d.outcome = "denied";
+            d.target = bundle.routes.denied.empty() ? std::string("null") : bundle.routes.denied;
+        } else {
+            d.outcome = "success";
+            d.target = bundle.routes.success.empty() ? replicationName + "-rqueue" : bundle.routes.success;
+        }
     }
     return d;
 }

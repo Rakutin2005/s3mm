@@ -62,7 +62,6 @@ target_compile_definitions(s3mm_core PUBLIC S3MM_VERSION="${PROJECT_VERSION}")
 add_executable(s3mmd
   src/daemon/daemon.cpp
   src/daemon/server.cpp
-  src/daemon/peerserver.cpp
   src/daemon/metrics.cpp
   src/daemon/main.cpp
 )
@@ -76,6 +75,24 @@ add_executable(s3mm
   src/cli/client.cpp
 )
 target_link_libraries(s3mm PRIVATE s3mm_core)
+
+# ------------------------------------------------------------- cluster client
+# s3mmc — independent cluster client daemon (peer mesh over mTLS, per-remote
+# UNIX sockets for the core). Links against s3mm_core but runs as its own
+# process; users who do not need clustering simply do not start it.
+add_library(s3mmc_lib STATIC
+  s3mmc/src/wire.cpp
+  s3mmc/src/transport.cpp
+  s3mmc/src/clusterclient.cpp
+  s3mmc/src/configfile.cpp
+)
+target_include_directories(s3mmc_lib PUBLIC ${CMAKE_SOURCE_DIR}/s3mmc/include)
+target_link_libraries(s3mmc_lib PUBLIC s3mm_core)
+
+add_executable(s3mmc s3mmc/src/main.cpp)
+target_link_libraries(s3mmc PRIVATE s3mmc_lib)
+
+# (cluster-client unit tests are maintained out-of-tree by the operator)
 
 # --------------------------------------------------------------- rest daemon
 add_executable(s3mmws

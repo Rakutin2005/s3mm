@@ -59,9 +59,22 @@ SigningResult signAt(http::Request& request, const Credentials& creds, const std
     std::string dateStamp = amzDateTime.substr(0, 8);
 
     auto parts = http::parseUrl(request.url);
-    std::string host = parts.host;
-    bool defaultPort = (parts.scheme == "https" && parts.port == "443") || (parts.scheme == "http" && parts.port == "80");
-    if (!defaultPort && !parts.port.empty()) host += ":" + parts.port;
+    std::string host;
+    if (parts.scheme == "unix") {
+        // unix:/path/to/sock#scheme://host:port/path — the authority after '#'
+        // is what we sign and send as Host; the socket only carries bytes.
+        auto hash = request.url.find('#');
+        std::string inner = hash == std::string::npos ? std::string() : request.url.substr(hash + 1);
+        auto innerParts = http::parseUrl(inner);
+        host = innerParts.valid ? innerParts.host : parts.host;
+        bool defaultPort = (innerParts.scheme == "https" && innerParts.port == "443") ||
+                           (innerParts.scheme == "http" && innerParts.port == "80");
+        if (!defaultPort && !innerParts.port.empty()) host += ":" + innerParts.port;
+    } else {
+        host = parts.host;
+        bool defaultPort = (parts.scheme == "https" && parts.port == "443") || (parts.scheme == "http" && parts.port == "80");
+        if (!defaultPort && !parts.port.empty()) host += ":" + parts.port;
+    }
 
     // payload hash
     if (!request.payloadHash.empty()) out.payloadHash = request.payloadHash;

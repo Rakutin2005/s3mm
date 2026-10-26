@@ -10,6 +10,7 @@
 
 #include "s3mm/common/fs.hpp"
 #include "s3mm/common/str.hpp"
+#include "s3mm/common/time.hpp"
 #include "s3mm/common/units.hpp"
 #include "s3mm/common/crypto.hpp"
 #include "s3mm/common/log.hpp"
@@ -1186,7 +1187,7 @@ int RestDaemon::run() {
                             std::ostringstream xml;
                             xml << "<ListBucketResult><Name>" << bucket << "</Name><Contents>";
                             for (auto& o : page.value().objects) {
-                                xml << "<Contents><Key>" << o.key << "</Key><Size>" << o.size << "</Size><LastModified>" << o.lastModified << "</LastModified><ETag>" << o.etag << "</ETag></Contents>";
+                                xml << "<Contents><Key>" << o.key << "</Key><Size>" << o.size << "</Size><LastModified>" << tm::toIso8601(o.lastModified) << "</LastModified><ETag>" << o.etag << "</ETag></Contents>";
                             }
                             xml << "</Contents></ListBucketResult>";
                             res.status = 200; res.headers["Content-Type"] = "application/xml"; res.body = xml.str();
