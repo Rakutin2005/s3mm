@@ -38,7 +38,9 @@ struct WsClusterSettings {
 };
 
 struct Options {
-    std::string config = "/etc/s3mm/s3mm.conf";
+    // s3mmws has its OWN configuration file (it never reads the core
+    // /etc/s3mm/s3mm.conf). See s3mm/rest/wsconfig.hpp for the grammar.
+    std::string config = "/etc/s3mm/s3mmws.conf";
     std::string socket;
     std::string listen = "127.0.0.1";
     int port = 8080;
@@ -47,6 +49,12 @@ struct Options {
     bool validateOnly = false;
     AuthSettings auth;
     WsClusterSettings wscluster;
+    // Track which fields were explicitly set on the command line so the file
+    // cannot silently override them (CLI > file > built-in defaults).
+    bool socketSet = false;
+    bool listenSet = false;
+    bool portSet = false;
+    bool modulesDirSet = false;
 };
 
 class RestDaemon {

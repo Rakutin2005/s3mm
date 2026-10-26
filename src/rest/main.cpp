@@ -4,6 +4,7 @@
 #include <string>
 
 #include "s3mm/rest/daemon.hpp"
+#include "s3mm/rest/wsconfig.hpp"
 
 namespace {
 void usage(std::FILE* out) {
@@ -38,16 +39,28 @@ int main(int argc, char** argv) {
     while ((opt = getopt_long(argc, argv, "c:s:l:p:m:dth", longOptions, nullptr)) != -1) {
         switch (opt) {
             case 'c': options.config = optarg; break;
-            case 's': options.socket = optarg; break;
-            case 'l': options.listen = optarg; break;
-            case 'p': options.port = std::stoi(optarg); break;
-            case 'm': options.modulesDir = optarg; break;
+            case 's': options.socket = optarg; options.socketSet = true; break;
+            case 'l': options.listen = optarg; options.listenSet = true; break;
+            case 'p': options.port = std::stoi(optarg); options.portSet = true; break;
+            case 'm': options.modulesDir = optarg; options.modulesDirSet = true; break;
             case 'd': options.daemonize = true; break;
             case 't': options.validateOnly = true; break;
             case 'h': usage(stdout); return 0;
             default: usage(stderr); return 2;
         }
     }
+    // Apply the standalone s3mmws configuration file. The file is mandatory
+    // unless it simply does not exist (then built-in defaults + CLI are used).
+    // Anything that exists but fails to parse or validate is a hard error.
+    if (!options.config.empty()) {
+        auto applied = s3mm::rest::WsConfig::apply(options.config, options);
+        if (!applied) {
+            std::fprintf(stderr, "s3mmws: %s\n", applied.error().c_str());
+            return options.validateOnly ? 1 : 2;
+        }
+        options = applied.value();
+    }
+    if (options.validateOnly) return 0;
     s3mm::rest::RestDaemon daemon(std::move(options));
     return daemon.run();
 }

@@ -892,93 +892,20 @@ void RestDaemon::registerDefaults() {
 }
 
 int RestDaemon::run() {
-    // Load config (optional) for socket/modules defaults.
-    std::string secretsDir;
-    std::string cacheDir;
-    if (!options_.config.empty()) {
-        auto cfg = config::Config::load(options_.config);
-        if (cfg) {
-            if (options_.validateOnly) return 0;
-            auto reg = registry::Registry::fromConfig(cfg.value());
-            if (reg) {
-                if (options_.socket.empty()) options_.socket = reg.value().settings().socket;
-                if (options_.modulesDir.empty()) options_.modulesDir = reg.value().settings().modulesDir;
-                secretsDir = reg.value().settings().secretsDir;
-                cacheDir = reg.value().settings().cacheDir;
-                registry_ = std::make_unique<registry::Registry>(std::move(reg.value()));
-            }
-            // parse s3mmws auth block
-            const config::Node* s3mm = cfg.value().s3mm();
-            const config::Node* ws = s3mm ? s3mm->find("s3mmws") : nullptr;
-            if (ws && ws->block) {
-                options_.auth.enabled = ws->boolValue("auth_enabled", options_.auth.enabled);
-                options_.auth.sessionTtl = (int)ws->int64Value("session_ttl", options_.auth.sessionTtl);
-                if (ws->value("rbac_store").size()) options_.auth.rbacStorePath = ws->value("rbac_store");
-                if (ws->value("users_file").size()) options_.auth.usersFile = ws->value("users_file");
-                const config::Node* authn = ws->find("auth");
-                if (authn && authn->block) {
-                    const config::Node* loc = authn->find("local");
-                    if (loc && loc->block) {
-                        options_.auth.localEnabled = loc->boolValue("enabled", true);
-                        if (loc->value("users_file").size()) options_.auth.usersFile = loc->value("users_file");
-                    }
-                    const config::Node* ldap = authn->find("ldap");
-                    if (ldap && ldap->block) {
-                        options_.auth.ldap.enabled = ldap->boolValue("enabled", false);
-                        options_.auth.ldap.url = ldap->value("url");
-                        options_.auth.ldap.bindDn = ldap->value("bind_dn");
-                        std::string bp = ldap->value("bind_password");
-                        std::string bpf = ldap->value("bind_password_file");
-                        if (!bpf.empty()) { auto c = fs::readFile(bpf); if (c) options_.auth.ldap.bindPassword = *c; }
-                        else options_.auth.ldap.bindPassword = bp;
-                        options_.auth.ldap.userSearchBase = ldap->value("user_search_base");
-                        if (ldap->value("user_filter").size()) options_.auth.ldap.userFilter = ldap->value("user_filter");
-                        options_.auth.ldap.groupSearchBase = ldap->value("group_search_base");
-                        if (ldap->value("group_filter").size()) options_.auth.ldap.groupFilter = ldap->value("group_filter");
-                        if (ldap->value("attr_uid").size()) options_.auth.ldap.attrUid = ldap->value("attr_uid");
-                        if (ldap->value("attr_mail").size()) options_.auth.ldap.attrMail = ldap->value("attr_mail");
-                        if (ldap->value("attr_display_name").size()) options_.auth.ldap.attrDisplayName = ldap->value("attr_display_name");
-                        // group_role_map "a=b;c=d"
-                        std::string gm = ldap->value("group_role_map");
-                        if (!gm.empty()) {
-                            std::istringstream iss(gm); std::string tok;
-                            while (std::getline(iss, tok, ';')) {
-                                size_t eq = tok.find('=');
-                                if (eq != std::string::npos) {
-                                    auto trim=[&](std::string x){size_t a=x.find_first_not_of(" 	");size_t b=x.find_last_not_of(" 	"); if(a==std::string::npos)return std::string(); return x.substr(a,b-a+1);};
-                                    options_.auth.ldap.groupRoleMap[trim(tok.substr(0,eq))]=trim(tok.substr(eq+1));
-                                }
-                            }
-                        }
-                    }
-                    const config::Node* kc = authn->find("keycloak");
-                    if (kc && kc->block) {
-                        options_.auth.keycloak.enabled = kc->boolValue("enabled", false);
-                        options_.auth.keycloak.issuer = kc->value("issuer");
-                        options_.auth.keycloak.clientId = kc->value("client_id");
-                        std::string csf = kc->value("client_secret_file");
-                        if (!csf.empty()) { auto c = fs::readFile(csf); if (c) options_.auth.keycloak.clientSecret = *c; }
-                        else options_.auth.keycloak.clientSecret = kc->value("client_secret");
-                        options_.auth.keycloak.realmRolesMap = kc->value("realm_roles_map");
-                        options_.auth.keycloak.useIntrospection = kc->boolValue("use_introspection", true);
-                    }
-                }
-            }
-        } else {
-            if (options_.validateOnly) return 1;
-        }
-    }
+    // s3mmws uses ONLY its own configuration file (/etc/s3mm/s3mmws.conf),
+    // parsed by WsConfig before run() is entered. The core daemon's
+    // /etc/s3mm/s3mm.conf is never read here: s3mmd owns the registry, the
+    // credentials and the clusters; s3mmws reaches all of that exclusively
+    // through the control socket (options_.socket).
     if (options_.validateOnly) return 0;
 
     if (options_.socket.empty()) options_.socket = "/run/s3mm/s3mm.sock";
-    if (options_.auth.rbacStorePath.empty()) {
-        std::string base = secretsDir.empty() ? (cacheDir.empty() ? "/tmp/opencode" : cacheDir) : secretsDir;
-        options_.auth.rbacStorePath = base + "/s3mmws_rbac.json";
-    }
-    if (options_.auth.usersFile.empty()) {
-        std::string base = secretsDir.empty() ? (cacheDir.empty() ? "/tmp/opencode" : cacheDir) : secretsDir;
-        options_.auth.usersFile = base + "/s3mmws_users.json";
-    }
+    // Persisted s3mmws state lives next to its own runtime dir, not in the
+    // core daemon's secrets dir (the ws process may not even have access).
+    if (options_.auth.rbacStorePath.empty())
+        options_.auth.rbacStorePath = "/var/lib/s3mmws/s3mmws_rbac.json";
+    if (options_.auth.usersFile.empty())
+        options_.auth.usersFile = "/var/lib/s3mmws/s3mmws_users.json";
     // init auth
     sessions_ = std::make_unique<SessionManager>(options_.auth.sessionTtl);
     rbac_ = std::make_unique<RbacStore>(options_.auth.rbacStorePath);
