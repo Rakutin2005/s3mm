@@ -62,7 +62,6 @@ target_compile_definitions(s3mm_core PUBLIC S3MM_VERSION="${PROJECT_VERSION}")
 add_executable(s3mmd
   src/daemon/daemon.cpp
   src/daemon/server.cpp
-  src/daemon/peerserver.cpp
   src/daemon/metrics.cpp
   src/daemon/main.cpp
 )

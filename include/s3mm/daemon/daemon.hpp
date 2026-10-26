@@ -5,7 +5,6 @@
 
 #include "s3mm/common/result.hpp"
 #include "s3mm/common/value.hpp"
-#include "s3mm/daemon/peerserver.hpp"
 #include "s3mm/module/loader.hpp"
 #include "s3mm/registry/registry.hpp"
 #include "s3mm/replication/engine.hpp"
@@ -19,18 +18,17 @@ struct Options {
     bool daemonize = false;
     bool runOnce = false;    // single scan+ship cycle and exit (cron/testing)
     bool validateOnly = false;
-    // peer (mTLS) settings
-    int peerPort = 0;        // 0 => disabled
-    std::string peerBind = "0.0.0.0";
-    std::string peerCert;
-    std::string peerKey;
-    std::string peerCa;
-    // configured peers
-    std::vector<std::string> peers;
 };
 
 /// The s3mmd process: configuration, module loading, the replication engine
 /// and the two servers (CLI control socket + Prometheus metrics).
+///
+/// Cluster / peer networking is NOT part of the core daemon: it lives in the
+/// optional s3mmc cluster client (see the s3mmc/ subproject). s3mmd treats a
+/// remote cluster as just another S3 endpoint; when that endpoint is a Unix
+/// socket published by s3mmc (remote-<cluster>.sock), s3mmc transparently
+/// routes the traffic over mTLS to the peer instance that owns the cluster.
+/// If the user does not need clustering, they simply do not run s3mmc.
 class Daemon {
 public:
     explicit Daemon(Options options);
@@ -67,7 +65,6 @@ private:
     Options options_;
     std::unique_ptr<module::Loader> loader_;
     std::unique_ptr<registry::Registry> registry_;
-    PeerServer peerServer_;
     std::unique_ptr<repl::Engine> engine_;
 
     int serverFd_ = -1;

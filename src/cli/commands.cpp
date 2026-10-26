@@ -210,16 +210,9 @@ Value buildRequest(const std::string& cmd, const std::vector<std::string>& rest)
     }
 
     if (cmd == "peer") {
-        Args a = parseArgs(rest, false);
-        std::string action = a.positional.empty() ? "list" : a.positional[0];
-        Value req = Value::object();
-        req.set("cmd", Value::str(cmd));
-        req.set("action", Value::str(action));
-        if (action == "add" || action == "remove") {
-            if (a.positional.size() < 2) throw UsageError("peer " + action + ": address required");
-            req.set("address", Value::str(a.positional[1]));
-        }
-        return req;
+        throw UsageError(
+            "peer: clustering is handled by the separate s3mmc cluster client — "
+            "configure peers in s3mmc.conf and manage them with the s3mmc binary");
     }
 
     // ---- registry reads ----------------------------------------------------
