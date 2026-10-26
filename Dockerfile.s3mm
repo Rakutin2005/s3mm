@@ -3,5 +3,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake g++ make libargon2-dev libldap2-dev liblber2-dev libcurl4-openssl-dev libssl-dev zlib1g-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . /src
-RUN mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j4 s3mmd s3mmws
-RUN cp /src/build/s3mmd /src/build/s3mmws /usr/local/bin/
+RUN mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j4
+RUN mkdir -p /usr/lib/s3mm/modules && cp /src/build/modules/*.so /usr/lib/s3mm/modules/ 2>/dev/null || true
+RUN cp /src/build/s3mmd /src/build/s3mm /src/build/s3mmws /src/build/s3mmc /src/build/s3mme /usr/local/bin/ 2>/dev/null || true

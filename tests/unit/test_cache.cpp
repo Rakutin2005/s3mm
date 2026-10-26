@@ -1,6 +1,7 @@
 #include "testkit.hpp"
 
 #include <cstdio>
+#include <unistd.h>
 #include <map>
 #include <string>
 
@@ -24,7 +25,7 @@ s3mm::s3::ObjectInfo makeInfo(const std::string& key, uint64_t size, const std::
     o.key = key;
     o.size = size;
     o.etag = etag;
-    o.lastModified = s3mm::tm::now();
+    o.lastModified = s3mm::tm::TimePoint{};
     return o;
 }
 

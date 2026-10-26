@@ -8,3 +8,11 @@ build-test/
 *.exe
 *.out
 *.bin
+
+# secrets and runtime state
+etc/secrets/
+run/
+*.pem
+*.key
+*.crt
+*.srl

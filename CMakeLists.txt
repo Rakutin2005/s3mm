@@ -92,6 +92,15 @@ target_link_libraries(s3mmc_lib PUBLIC s3mm_core)
 add_executable(s3mmc s3mmc/src/main.cpp)
 target_link_libraries(s3mmc PRIVATE s3mmc_lib)
 
+# --------------------------------------------------------------- event broker client
+add_executable(s3mme
+  s3mme/src/main.cpp
+  s3mme/src/event.cpp
+  s3mme/src/loader.cpp
+)
+target_include_directories(s3mme PRIVATE ${CMAKE_SOURCE_DIR}/s3mme/include)
+target_link_libraries(s3mme PRIVATE s3mm_core ${CMAKE_DL_LIBS})
+
 # (cluster-client unit tests are maintained out-of-tree by the operator)
 
 # --------------------------------------------------------------- rest daemon
@@ -122,6 +131,11 @@ target_link_libraries(s3mm_mod_minio PRIVATE ${ARGON2_LIBRARY})
 s3mm_module(aws    modules/aws/mod_aws.cpp)
 s3mm_module(ceph   modules/ceph/mod_ceph.cpp)
 s3mm_module(rustfs modules/rustfs/mod_rustfs.cpp)
+
+s3mm_module(kafka modules/kafka/mod_kafka.cpp)
+target_include_directories(s3mm_mod_kafka PRIVATE ${CMAKE_SOURCE_DIR}/s3mme/include)
+s3mm_module(rabbitmq modules/rabbitmq/mod_rabbitmq.cpp)
+target_include_directories(s3mm_mod_rabbitmq PRIVATE ${CMAKE_SOURCE_DIR}/s3mme/include)
 
 # ---------------------------------------------------------------------- tests
 enable_testing()
@@ -157,5 +171,47 @@ target_link_libraries(s3mm_e2e PRIVATE s3mm_core)
 add_test(NAME e2e COMMAND s3mm_e2e)
 
 # ------------------------------------------------------------------- install
-install(TARGETS s3mmd s3mm s3mmws RUNTIME DESTINATION bin)
+install(TARGETS s3mmd s3mm s3mmws s3mme RUNTIME DESTINATION bin)
+
+# Configuration (exclude secrets)
+install(DIRECTORY etc/s3mm/ DESTINATION etc/s3mm
+        FILES_MATCHING PATTERN "*.conf")
+install(FILES systemd/s3mmd.service DESTINATION lib/systemd/system)
+
+# Ensure cache/runtime dirs exist
+install(DIRECTORY DESTINATION var/cache/s3mm)
+install(DIRECTORY DESTINATION run/s3mm)
+
 install(DIRECTORY ${CMAKE_BINARY_DIR}/modules/ DESTINATION lib/s3mm/modules FILES_MATCHING PATTERN "*.so")
+
+
+# ---------------------------------------------------------------- packaging (rpm/deb)
+set(CPACK_PACKAGE_NAME "s3mm")
+set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_PACKAGE_VENDOR "s3mm")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "S3 replication daemon, CLI, REST and cluster client")
+set(CPACK_PACKAGE_CONTACT "s3mm maintainers")
+set(CPACK_PACKAGING_INSTALL_PREFIX "/usr")
+set(CPACK_GENERATOR "RPM;DEB")
+
+set(CPACK_RPM_PACKAGE_LICENSE "Apache-2.0")
+set(CPACK_RPM_PACKAGE_GROUP "System Environment/Daemons")
+set(CPACK_RPM_PACKAGE_REQUIRES "libcurl >= 8.0, openssl-libs >= 3.0, argon2, zlib, openldap, systemd")
+set(CPACK_RPM_FILE_NAME "RPM-DEFAULT")
+set(CPACK_RPM_POST_INSTALL_SCRIPT_FILE "${CMAKE_SOURCE_DIR}/packaging/postinst")
+
+set(CPACK_DEBIAN_PACKAGE_MAINTAINER "s3mm maintainers")
+set(CPACK_DEBIAN_PACKAGE_DEPENDS "libcurl4 (>= 8.0), libssl3 (>= 3.0), libargon2-1, zlib1g, libldap-2.5-0, systemd")
+set(CPACK_DEBIAN_FILE_NAME "DEB-DEFAULT")
+set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA "${CMAKE_SOURCE_DIR}/packaging/postinst")
+
+include(CPack)
+
+add_custom_target(package_rpm
+    COMMAND ${CMAKE_CPACK_COMMAND} -G RPM --config CPackConfig.cmake
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Building RPM package")
+add_custom_target(package_deb
+    COMMAND ${CMAKE_CPACK_COMMAND} -G DEB --config CPackConfig.cmake
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Building DEB package")

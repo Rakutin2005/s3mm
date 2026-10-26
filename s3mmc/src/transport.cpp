@@ -61,7 +61,7 @@ Result<void> Channel::sendFile(Value frame, const std::string& filePath, const s
         auto body = fs::readFile(filePath);
         if (!body) return Result<void>::failure("spool: cannot read '" + filePath + "'");
         Value payload = Value::object();
-        payload.set("b64", Value::str(base64Encode(*body)));
+        payload.set("b64", Value::str(s3mm::crypto::base64Encode(*body)));
         payload.set("bytes", Value::number((int64_t)*sz));
         frame.set(dataKey, payload);
         fs::removeFile(filePath);

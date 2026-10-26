@@ -106,7 +106,7 @@ Result<void> applyConfigText(ClusterClient& client, const std::string& text,
     for (const auto* sc : scopes) {
         for (const auto& exN : sc->findAll("expose")) {
             const config::Node& ex = *exN;
-            Options::ExposeRule rule;
+            ClusterClient::Options::ExposeRule rule;
             rule.line = ex.line;
             std::string spec;
             // Accept both forms: `expose a b c;` (args) and `expose { a; b; };`
@@ -116,7 +116,7 @@ Result<void> applyConfigText(ClusterClient& client, const std::string& text,
                 spec += ex.arg(i);
             }
             if (spec.empty()) {
-                for (const auto& d : ex.directives()) {
+                for (const auto& d : ex.children) {
                     if (d.name == "to" || d.name == "order") continue;
                     if (!spec.empty()) spec += ",";
                     spec += d.name;
@@ -130,7 +130,7 @@ Result<void> applyConfigText(ClusterClient& client, const std::string& text,
             if (!el) return Result<void>::failure(el.error());
             rule.spec = spec;
             // scoped block form: `to`/`order` may be nested directives ...
-            for (const auto& d : ex.directives()) {
+            for (const auto& d : ex.children) {
                 if (d.name == "to" && d.hasArg(0)) rule.appliesTo = d.arg(0);
                 if (d.name == "order" && d.hasArg(0)) {
                     try { rule.order = std::stoi(d.arg(0)); }
@@ -237,7 +237,7 @@ Result<std::vector<std::string>> parseManagedList(const std::string& spec) {
     std::vector<std::string> out;
     for (auto& p : parts) {
         if (p.empty()) continue;
-        if (p == "*") return Result<std::vector<std::string>>::success(std::vector<std::string>{"*"});
+        if (p == "*") return Result<std::vector<std::string>>(std::vector<std::string>{"*"});
         if (p == "none" || p == "off") continue;  // explicit none => empty list
         // Reject accidental wildcards inside the list to keep semantics sharp.
         if (p.find('*') != std::string::npos)
@@ -245,7 +245,7 @@ Result<std::vector<std::string>> parseManagedList(const std::string& spec) {
                 "managed: wildcard only allowed as the sole value '*'");
         out.push_back(p);
     }
-    return Result<std::vector<std::string>>::success(std::move(out));
+    return Result<std::vector<std::string>>(std::move(out));
 }
 
 } // namespace s3mm::s3mmc

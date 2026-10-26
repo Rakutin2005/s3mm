@@ -23,6 +23,10 @@
 #include "s3mme/broker.hpp"
 
 namespace {
+static std::string getCfgString(const s3mm::Value& cfg, const char* key, const std::string& def = {}) {
+    if (auto* v = cfg.find(key)) return v->asString(def);
+    return def;
+}
 
 // ------------------------------------------------------------ crc32c
 uint32_t crc32c(const void* data, size_t len) {
@@ -217,13 +221,13 @@ public:
     const char* name() const override { return "kafka"; }
 
     s3mm::Result<void> connect(const s3mm::Value& cfg) override {
-        hosts_ = cfg.getString("hosts", "localhost:9092");
-        topic_ = cfg.getString("topic", "s3mm.events");
+        hosts_ = getCfgString(cfg, "hosts", "localhost:9092");
+        topic_ = getCfgString(cfg, "topic", "s3mm.events");
         std::string err;
         fd_ = tcpConnect(hosts_, err);
         if (fd_ < 0) return s3mm::Result<void>::failure(err);
-        if (cfg.getString("sasl") == "on") {
-            std::string user = cfg.getString("sasl_user"), pass = cfg.getString("sasl_pass");
+        if (getCfgString(cfg, "sasl") == "on") {
+            std::string user = getCfgString(cfg, "sasl_user"), pass = getCfgString(cfg, "sasl_pass");
             if (!saslPlain(user, pass, err)) { ::close(fd_); fd_ = -1; return s3mm::Result<void>::failure(err); }
         }
         running_ = true;

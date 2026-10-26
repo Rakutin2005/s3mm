@@ -5,6 +5,7 @@
 #include "s3mm/common/value.hpp"
 
 namespace s3mme {
+using s3mm::Value;
 
 /// One routing/replication decision as observed by the core engine and
 /// translated into an event by s3mme. Mirrors s3mm::repl::RouteInfo, but is

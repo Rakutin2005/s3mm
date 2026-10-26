@@ -252,8 +252,17 @@ Result<void> Registry::parsePolicy(const Node& node) {
 
 Result<Registry> Registry::fromConfig(const config::Config& cfg) {
     Registry registry;
-    if (!cfg.s3mm()) return Result<Registry>::failure("config has no 's3mm' block");
-    const Node& root = *cfg.s3mm();
+    const config::Node* rootPtr = cfg.s3mm();
+    config::Node synthetic;
+    if (!rootPtr) {
+        // Allow config files without the legacy "s3mm { ... }" wrapper:
+        // treat all top-level nodes as the contents of the implicit root.
+        synthetic.name = "s3mm";
+        synthetic.block = true;
+        for (const auto& r : cfg.roots()) synthetic.children.push_back(r);
+        rootPtr = &synthetic;
+    }
+    const Node& root = *rootPtr;
 
     auto settingsRes = registry.parseSettings(root);
     if (!settingsRes) return Result<Registry>::failure(settingsRes.error());

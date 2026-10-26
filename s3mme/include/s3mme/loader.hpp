@@ -8,6 +8,7 @@
 #include "s3mm/common/result.hpp"
 
 namespace s3mme {
+template<class T> using Result = s3mm::Result<T>;
 
 /// dlopen-based loader for broker modules (s3mme_mod_*.so). Same idea as the
 /// core vendor-module loader, but resolves `s3mme_broker_entry` instead of

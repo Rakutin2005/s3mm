@@ -909,7 +909,9 @@ int RestDaemon::run() {
             }
             // parse s3mmws auth block
             const config::Node* s3mm = cfg.value().s3mm();
-            const config::Node* ws = s3mm ? s3mm->find("s3mmws") : nullptr;
+            const config::Node* ws = nullptr;
+            if (s3mm) ws = s3mm->find("s3mmws");
+            if (!ws) for (const auto& r : cfg.value().roots()) if (r.name == "s3mmws") { ws = &r; break; }
             if (ws && ws->block) {
                 options_.auth.enabled = ws->boolValue("auth_enabled", options_.auth.enabled);
                 options_.auth.sessionTtl = (int)ws->int64Value("session_ttl", options_.auth.sessionTtl);
@@ -1041,7 +1043,9 @@ int RestDaemon::run() {
         auto cfg2 = config::Config::load(options_.config);
         if (cfg2) {
             const config::Node* s3mm2 = cfg2.value().s3mm();
-            const config::Node* wc = s3mm2 ? s3mm2->find("wscluster") : nullptr;
+            const config::Node* wc = nullptr;
+            if (s3mm2) wc = s3mm2->find("wscluster");
+            if (!wc) for (const auto& r : cfg2.value().roots()) if (r.name == "wscluster") { wc = &r; break; }
             if (wc && wc->block) {
                 options_.wscluster.enabled = wc->boolValue("enabled", false);
                 options_.wscluster.bind = wc->value("bind", options_.wscluster.bind);

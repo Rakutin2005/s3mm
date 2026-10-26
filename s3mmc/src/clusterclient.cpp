@@ -41,7 +41,7 @@ namespace {
 
 int64_t nowSec() { return (int64_t)tm::toSeconds(tm::now()); }
 
-std::string newTaskId(const std::string& nodeId, uint64_t& seq) {
+std::string newTaskId(const std::string& nodeId, std::atomic<uint64_t>& seq) {
     char buf[64];
     std::snprintf(buf, sizeof buf, "%s-%llx-%llu", nodeId.c_str(), (unsigned long long)nowSec(),
                   (unsigned long long)seq.fetch_add(1));
@@ -236,9 +236,8 @@ Result<void> ClusterClient::setPeers(std::vector<PeerConfig> peers) {
     for (auto& p : peers) {
         if (p.id.empty()) return Result<void>::failure("peer requires an id");
         if (p.address.empty()) return Result<void>::failure("peer '" + p.id + "' requires an address");
-        PeerRuntime rt;
+        PeerRuntime& rt = peers_[p.id];
         rt.cfg = p;
-        peers_[p.id] = rt;
         byAddress_[p.address] = p.id;
     }
     rebuildRoutesLocked();
@@ -248,10 +247,9 @@ Result<void> ClusterClient::setPeers(std::vector<PeerConfig> peers) {
 Result<void> ClusterClient::addPeer(PeerConfig p) {
     std::lock_guard<std::recursive_mutex> lk(mutex_);
     if (p.id.empty() || p.address.empty()) return Result<void>::failure("peer add: id and address required");
-    PeerRuntime rt;
+    PeerRuntime& rt = peers_[p.id];
     rt.cfg = std::move(p);
-    peers_[rt.cfg.id] = std::move(rt);
-    byAddress_[peers_[rt.cfg.id].cfg.address] = peers_[rt.cfg.id].cfg.id;
+    byAddress_[rt.cfg.address] = rt.cfg.id;
     rebuildRoutesLocked();
     return Result<void>::success();
 }
@@ -310,7 +308,7 @@ Result<std::vector<std::string>> ClusterClient::parseExposeList(const std::strin
     if (sawStar && (out.size() > 1 || sawExcl))
         return Result<std::vector<std::string>>::failure(
             "expose: wildcard '*' must be the sole value or replaced by an explicit list");
-    return Result<std::vector<std::string>>::success(std::move(out));
+    return Result<std::vector<std::string>>(std::move(out));
 }
 
 Result<void> ClusterClient::configure(const Options& opts, const TlsConfig& tls) {
@@ -498,7 +496,7 @@ Result<Value> ClusterClient::pullPeerCredentials(const std::string& peerId,
     if (!coreCall(req, -1, &reply))
         return Result<Value>::failure("core rejected credential import");
     if (const Value* ok = reply.find("ok"); ok && ok->asBool(false))
-        return Result<Value>::success(credsR.value());
+        return Result<Value>(credsR.value());
     return Result<Value>::failure(reply.getString("error", "core credential import failed"));
 }
 
@@ -836,7 +834,7 @@ ServeOutcome ClusterClient::routeTaskToCluster(const std::string& clusterId, con
 
 // ------------------------------------------- socket provisioning (requiredOnly) --
 
-std::vector<std::string> ClusterClient::requiredClustersLocked() const {
+std::vector<std::string> ClusterClient::requiredClustersLocked() {
     // Foreign clusters referenced by our own replication rules. The core owns
     // the truth; we ask it over the control socket and cache briefly so the
     // poll loop does not hammer it.
@@ -913,7 +911,7 @@ peer::Inventory ClusterClient::filteredInventoryFor(const std::string& peerId) c
     if (wantClusters) {
         bool fullClusters = on("clusters");
         for (const auto& c : localInv_.clusters) {
-            InventoryCluster cc = c;
+            peer::InventoryCluster cc = c;
             if (!fullClusters) {
                 if (!on("endpoints")) cc.endpoints.clear();
                 if (!on("zones")) cc.zone.clear();
@@ -973,7 +971,7 @@ Value ClusterClient::buildHelloFrame(const std::string& forPeer) {
     Value f = Value::object();
     f.set("type", Value::str("hello"));
     f.set("from", Value::str(opts_.nodeId));
-    f.set("version", Value::number(kProtocolVersion));
+    f.set("version", Value::number((int64_t)s3mm::peer::kProtocolVersion));
     f.set("inventory", filteredInventoryFor(forPeer).toJson());
     return f;
 }
@@ -1040,7 +1038,7 @@ std::vector<Value> ClusterClient::handlePeerFrame(const std::string& peerIdHint,
 
 Value ClusterClient::onHello(const std::string& peerId, const Value& frame, std::shared_ptr<Channel> ch) {
     std::string theirNode = frame.getString("from");
-    bool dialectOk = frame.find("version") && frame.find("version")->asInt(0) == kProtocolVersion;
+    bool dialectOk = frame.find("version") && frame.find("version")->asInt(0) == s3mm::peer::kProtocolVersion;
     if (!dialectOk) {
         Value err = Value::object();
         err.set("type", Value::str("error"));
@@ -1079,9 +1077,8 @@ void ClusterClient::applyInventoryFrom(const std::string& peerId, const peer::In
         cfg.id = peerId;
         cfg.address = "discovered";
         cfg.dial = false;
-        PeerRuntime rt;
+        PeerRuntime& rt = peers_[peerId];
         rt.cfg = cfg;
-        peers_[peerId] = rt;
         it = peers_.find(peerId);
     }
     it->second.inventory = inv;
@@ -1424,7 +1421,7 @@ Result<std::string> ClusterClient::requestConfigFromPeer(const std::string& peer
     const Value* res = reply.find("result");
     if (!res || !res->isString())
         return Result<std::string>::failure("config_get returned no text");
-    return Result<std::string>::success(res->asString());
+    return Result<std::string>(res->asString());
 }
 
 Result<Value> ClusterClient::requestCredsFromPeer(const std::string& peerId,
@@ -1463,7 +1460,7 @@ Result<Value> ClusterClient::requestCredsFromPeer(const std::string& peerId,
     }
     const Value* res = reply.find("result");
     if (!res) return Result<Value>::failure("cred_response without payload");
-    return Result<Value>::success(*res);
+    return Result<Value>(*res);
 }
 
 // ------------------------------------------------------------------- loops ---
@@ -1522,7 +1519,7 @@ void ClusterClient::controlLoop() {
                     pv.set("cn", Value::str(pr.peerCN));
                     pv.set("managed_by_us", Value::boolean(isManagerOf(id)));
                     pv.set("inventory_revision",
-                          Value::integer(pr.hasInventory ? (int64_t)pr.inventory.revision : 0));
+                          Value::number(pr.hasInventory ? (int64_t)pr.inventory.revision : 0));
                     arr.push(pv);
                 }
                 reply.set("peers", arr);
@@ -1550,7 +1547,7 @@ void ClusterClient::controlLoop() {
                 // Replace the managed list live. Persistence is the operator's
                 // job (edit s3mmc.conf or push it via push-config), because a
                 // manager may rewrite the whole file anyway.
-                Value* lst = req.find("nodes");
+                const Value* lst = req.find("nodes");
                 if (!lst || !lst->isArray()) {
                     reply.set("ok", Value::boolean(false));
                     reply.set("error", Value::str("set-managed: \"nodes\" array required"));
@@ -1589,7 +1586,7 @@ void ClusterClient::controlLoop() {
             } else if (req.getString("cmd") == "pull-config") {
                 auto r = pullPeerConfig(req.getString("peer"));
                 reply.set("ok", Value::boolean(static_cast<bool>(r)));
-                if (r) reply.set("text", Value::str(*r.value()));
+                if (r) reply.set("text", Value::str(r.value()));
                 else reply.set("error", Value::str(r.error()));
             } else if (req.getString("cmd") == "push-config") {
                 std::string peer = req.getString("peer");
@@ -1663,9 +1660,8 @@ void ClusterClient::sessionLoop(std::shared_ptr<Channel> ch, std::string peerIdH
                 cfg.id = peerId;
                 cfg.address = "inbound";
                 cfg.dial = false;
-                PeerRuntime rt;
+                PeerRuntime& rt = peers_[peerId];
                 rt.cfg = cfg;
-                peers_[peerId] = rt;
                 it = peers_.find(peerId);
             }
             it->second.connected = true;
@@ -1850,7 +1846,7 @@ void ClusterClient::rebuildRoutesLocked() {
         for (const auto& c : rt.inventory.localClusters)
             if (!ownsClusterLocked(c)) routes_.emplace(c, id);
         for (const auto& c : rt.inventory.clusters)
-            if (!ownsClusterLocked(c)) routes_.emplace(c.id, id);
+            if (!ownsClusterLocked(c.id)) routes_.emplace(c.id, id);
     }
     // Provision remote[id] UNIX listeners. With requiredOnly=true we bind a
     // socket only for clusters that local replication rules actually reference
@@ -1978,7 +1974,7 @@ Value ClusterClient::statusValue() const {
         for (const auto& a : opts_.peerAcls) {
             Value av = Value::object();
             av.set("to", Value::str(a.pattern));
-            av.set("priority", Value::number(a.priority));
+            av.set("priority", Value::number((int64_t)a.priority));
             Value el = Value::array();
             for (const auto& e : a.elements) el.push(Value::str(e));
             av.set("elements", el);
@@ -2023,7 +2019,7 @@ Value ClusterClient::describeVisibility(const std::string& peerId) const {
     for (const auto& p : *pat) el.push(Value::str(p));
     v.set("elements", el);
     // What would actually be disclosed right now:
-    Inventory probe = filteredInventoryFor(peerId);
+    peer::Inventory probe = filteredInventoryFor(peerId);
     Value seen = Value::object();
     seen.set("clusters", Value::number((int64_t)probe.clusters.size()));
     seen.set("replications", Value::number((int64_t)probe.replications.size()));

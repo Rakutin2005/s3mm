@@ -44,9 +44,9 @@ Result<void> BrokerLoader::loadFile(const std::string& path) {
 Result<void> BrokerLoader::loadDir(const std::string& dir) {
     std::string lastError;
     bool any = false;
-    for (const auto& entry : fs::listDir(dir)) {
-        if (!str::endsWith(entry, ".so")) continue;
-        auto res = loadFile(fs::joinPath(dir, entry));
+    for (const auto& entry : s3mm::fs::listDir(dir)) {
+        if (!s3mm::str::endsWith(entry, ".so")) continue;
+        auto res = loadFile(s3mm::fs::joinPath(dir, entry));
         if (!res) {
             lastError = res.error();
             LOG_WARN("broker load failed: ", res.error());
@@ -67,7 +67,7 @@ Result<void> BrokerLoader::loadDefaults() {
     std::string lastError;
     bool any = false;
     for (const auto& d : dirs) {
-        if (!fs::exists(d)) continue;
+        if (!s3mm::fs::exists(d)) continue;
         auto res = loadDir(d);
         if (res) any = true;
         else lastError = res.error();

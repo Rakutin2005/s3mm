@@ -7,6 +7,8 @@
 #include "s3mm/common/result.hpp"
 
 namespace s3mme {
+using s3mm::Value;
+template<class T> using Result = s3mm::Result<T>;
 
 /// Capabilities a broker module declares; s3mme degrades gracefully.
 struct BrokerFeatures {

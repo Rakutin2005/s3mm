@@ -38,7 +38,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.s3mm
-    command: ["/usr/local/bin/s3mmd", "-c", "/etc/s3mm/s3mm.conf"]
+    command: ["/usr/local/bin/s3mmd", "-c", "/etc/s3mm/s3mmd.conf"]
     volumes:
       - ./docker/etc2:/etc/s3mm
     depends_on:
@@ -50,7 +50,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.s3mm
-    command: ["/usr/local/bin/s3mmws", "-c", "/etc/s3mm/s3mm.conf", "-l", "0.0.0.0", "-p", "8080"]
+    command: ["/usr/local/bin/s3mmws", "-c", "/etc/s3mm/s3mmd.conf", "-l", "0.0.0.0", "-p", "8080"]
     ports:
       - "8083:8080"
       - "9444:9443"

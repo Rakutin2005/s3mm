@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || true
+fi
+mkdir -p /var/cache/s3mm /run/s3mm /etc/s3mm/secrets
+chmod 755 /var/cache/s3mm /run/s3mm /etc/s3mm
+exit 0

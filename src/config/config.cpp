@@ -274,6 +274,20 @@ Result<Config> Config::parse(const std::string& text, const std::string& filenam
     }
     for (const auto& r : cfg.roots_)
         if (r.name == "s3mm" && r.block) { cfg.s3mm_ = &r; break; }
+    // Allow configuration files without the legacy "s3mm { ... }" wrapper:
+    // wrap all top-level nodes into an implicit s3mm block so the rest of
+    // the system (and s3mmc/s3mme) keeps working unchanged.
+    if (!cfg.s3mm_ && !cfg.roots_.empty()) {
+        config::Node wrapper;
+        wrapper.name = "s3mm";
+        wrapper.block = true;
+        wrapper.file = cfg.path_;
+        wrapper.line = 1;
+        wrapper.children = cfg.roots_;
+        cfg.roots_.clear();
+        cfg.roots_.push_back(std::move(wrapper));
+        cfg.s3mm_ = &cfg.roots_.back();
+    }
     return Result<Config>(std::move(cfg));
 }
 

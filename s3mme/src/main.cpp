@@ -28,7 +28,10 @@
 #include "s3mm/common/log.hpp"
 #include "s3mm/common/str.hpp"
 #include "s3mm/common/value.hpp"
+#include "s3mm/common/units.hpp"
 #include "s3mm/config/config.hpp"
+#include "s3mm/policy/bundle.hpp"
+#include "s3mm/policy/engine.hpp"
 
 #include "s3mme/event.hpp"
 #include "s3mme/loader.hpp"
@@ -68,11 +71,28 @@ struct Opts {
 };
 
 bool loadConfig(const std::string& path, Opts& o, std::string& err) {
-    auto parsed = s3mm::config::parseFile(path);
+    auto file = s3mm::fs::readFile(path);
+    if (!file) { err = "cannot read " + path; return false; }
+    auto parsed = s3mm::config::Config::parse(*file, path);
     if (!parsed) { err = parsed.error(); return false; }
-    const auto& root = parsed.value();
+    const auto& cfg = parsed.value();
+
+    std::vector<const s3mm::config::Node*> scopes;
+    for (const auto& root : cfg.roots()) {
+        if (root.name == "s3mme" || root.name == "s3mm") {
+            for (const auto& c : root.children) scopes.push_back(&c);
+        } else {
+            scopes.push_back(&root);
+        }
+    }
+    if (scopes.empty()) { err = "empty configuration"; return false; }
+
     auto first = [&](const char* key) -> std::string {
-        if (auto v = root.get(key)) return v->asStringOr("");
+        for (const auto* sc : scopes) {
+            if (const auto* n = sc->find(key)) {
+                if (n->hasArg(0)) return n->arg(0);
+            }
+        }
         return {};
     };
     if (auto v = first("node"); !v.empty()) o.node = v;
@@ -82,18 +102,20 @@ bool loadConfig(const std::string& path, Opts& o, std::string& err) {
     if (auto v = first("poll_interval"); !v.empty()) o.pollInterval = v;
     if (auto v = first("default_broker"); !v.empty()) o.defaultBroker = v;
     if (auto v = first("policy"); !v.empty()) o.policyBundle = v;
-    if (auto v = first("send_all")) o.sendAll = v == "on" || v == "true" || v == "1";
-    for (const auto& n : root.children) {
-        if (n.name == "broker") {
-            std::string nm = n.positional;
+    if (auto v = first("send_all"); !v.empty()) o.sendAll = v == "on" || v == "true" || v == "1";
+
+    for (const auto* sc : scopes) {
+        if (sc->name == "broker") {
+            std::string nm = sc->hasArg(0) ? sc->arg(0) : "";
             if (!nm.empty()) {
                 o.brokers.push_back(nm);
                 if (o.defaultBroker.empty()) o.defaultBroker = nm;
             }
-        } else if (n.name == "policy" && !n.positional.empty()) {
-            o.policyBundle = n.positional;
+        } else if (sc->name == "policy" && sc->hasArg(0)) {
+            o.policyBundle = sc->arg(0);
         }
     }
+    // also children of wrapper blocks already flattened via scopes? Broker blocks at top level yes.
     if (o.brokers.empty()) { err = "no broker{} blocks in config"; return false; }
     return true;
 }
@@ -130,14 +152,14 @@ s3mm::Value coreCall(const std::string& sockPath, const s3mm::Value& req, std::s
     ::shutdown(fd, SHUT_RDWR);
     ::close(fd);
     if (buf.empty()) { err = "empty reply from core"; return {}; }
-    auto v = s3mm::Value::parse(buf);
-    if (!v) { err = "bad json reply: " + v.error(); return {}; }
-    return v.value();
+    std::string perr;
+    auto v = s3mm::Value::parseJson(buf, &perr);
+    if (v.isNull()) { err = "bad json reply: " + perr; return {}; }
+    return v;
 }
 
 int64_t parsePollSec(const std::string& s) {
-    auto p = s3mm::units::parseDuration(s);
-    if (p) return (int64_t)p.value().count();
+    try { return s3mm::units::parseDurationSeconds(s); } catch (...) {}
     // tolerate plain numbers
     try { return std::stoll(s); } catch (...) {}
     return 2;
@@ -146,7 +168,7 @@ int64_t parsePollSec(const std::string& s) {
 std::string controlSocketPath(const Opts& o) { return o.runDir + "/" + o.node + "/s3mme.sock"; }
 
 void writePidfile(const Opts& o) {
-    fs::makeDir(o.runDir + "/" + o.node);
+    s3mm::fs::mkdirp(o.runDir + "/" + o.node);
     std::ofstream pf(controlSocketPath(o) + ".pid", std::ios::trunc);
     pf << ::getpid() << "\n";
 }
@@ -173,7 +195,7 @@ int main(int argc, char** argv) {
         case 't': selfTest = true; break;
         case 'J': asJson = true; break;
         case 'h': usage(stdout); return 0;
-        case 'V': std::printf("s3mme %s\n", S3MM_VERSION); return 0;
+        case 'V': std::printf("s3mme %s\n", "0.1.0"); return 0;
         default: usage(stderr); return 2;
         }
     }
@@ -182,7 +204,7 @@ int main(int argc, char** argv) {
     if (command == "status") {
         std::string err;
         s3mm::Value req;
-        req.set("cmd", "s3mme-status");
+        req.set("cmd", s3mm::Value::str("s3mme-status"));
         auto rep = coreCall(cfgPath.empty() ? "" : cfgPath, req, err); // not used
         (void)rep;
         // status comes from our own control socket instead:
@@ -210,8 +232,9 @@ int main(int argc, char** argv) {
         ::close(fd);
         if (asJson) std::printf("%s", buf.c_str());
         else {
-            auto v = s3mm::Value::parse(buf);
-            if (v) std::printf("%s\n", v.value().toJson(2).c_str());
+            std::string perr;
+            auto v = s3mm::Value::parseJson(buf, &perr);
+            if (!v.isNull()) std::printf("%s\n", v.toJson(2).c_str());
             else std::printf("%s", buf.c_str());
         }
         return 0;
@@ -239,10 +262,10 @@ int main(int argc, char** argv) {
     // config file with the core policy parser; absence => send-all.
     std::unique_ptr<s3mm::policy::Bundle> bundle;
     if (!o.policyBundle.empty()) {
-        auto parsed = s3mm::config::parseFile(cfgPath);
+        auto file2 = s3mm::fs::readFile(cfgPath); auto parsed = file2 ? s3mm::config::Config::parse(*file2, cfgPath) : s3mm::config::Config::parse("", cfgPath);
         if (parsed) {
-            for (const auto& n : parsed.value().children) {
-                if (n.name == "policy" && n.positional == o.policyBundle) {
+            for (const auto& n : parsed.value().roots()) {
+                if (n.name == "policy" && n.hasArg(0) && n.arg(0) == o.policyBundle) {
                     auto b = s3mm::policy::Bundle::fromNode(n);
                     if (!b) { std::fprintf(stderr, "s3mme: policy: %s\n", b.error().c_str()); return 1; }
                     bundle = std::make_unique<s3mm::policy::Bundle>(b.value());
@@ -262,16 +285,16 @@ int main(int argc, char** argv) {
     }
 
     // Connect brokers (each gets its broker{} block as config Value).
-    auto parsedRoot = s3mm::config::parseFile(cfgPath);
+    auto parsedRootFile = s3mm::fs::readFile(cfgPath); auto parsedRoot = parsedRootFile ? s3mm::config::Config::parse(*parsedRootFile, cfgPath) : s3mm::config::Config::parse("", cfgPath);
     std::map<std::string, const s3mm::config::Node*> brokerNodes;
     if (parsedRoot) {
-        for (const auto& n : parsedRoot.value().children)
-            if (n.name == "broker") brokerNodes[n.positional] = &n;
+        for (const auto& n : parsedRoot.value().roots())
+            if (n.name == "broker" && n.hasArg(0)) brokerNodes[n.arg(0)] = &n;
     }
     for (auto& [name, b] : brokers) {
         s3mm::Value cfg;
         if (auto it = brokerNodes.find(name); it != brokerNodes.end()) {
-            for (const auto& d : it->second->directives) cfg.set(d.first, d.second);
+            for (const auto& d : it->second->children) cfg.set(d.name, s3mm::Value::str(d.hasArg(0)?d.arg(0):""));
         }
         auto res = b->connect(cfg);
         if (!res) {
@@ -325,8 +348,8 @@ int main(int argc, char** argv) {
 
     while (!g_stop) {
         s3mm::Value req;
-        req.set("cmd", "replication-route");
-        req.set("limit", (int64_t)500);
+        req.set("cmd", s3mm::Value::str("replication-route"));
+        req.set("limit", s3mm::Value::number((int64_t)500));
         std::string cerr;
         auto rep = coreCall(o.coreSocket, req, cerr);
         if (!cerr.empty()) {
@@ -334,22 +357,22 @@ int main(int argc, char** argv) {
         } else if (auto* arr = rep.find("routes")) {
             // Records arrive newest-first; walk reversed to keep order.
             std::vector<const s3mm::Value*> items;
-            for (auto& it : arr->list()) items.push_back(&it);
+            for (auto& it : arr->items()) items.push_back(&it);
             for (auto it = items.rbegin(); it != items.rend(); ++it) {
                 const auto& ri = **it;
                 s3mme::Event ev;
                 ev.id = o.node + "-" + std::to_string(++seq);
-                ev.atSec = (int64_t)ri.get("at")->asNumberOr(0);
+                ev.atSec = (int64_t)ri.find("at")->asInt(0);
                 ev.node = o.node;
-                ev.replication = ri.get("replication")->asStringOr("");
-                ev.kind = ri.get("kind")->asStringOr("object");
-                ev.bucket = ri.get("bucket")->asStringOr("");
-                ev.key = ri.get("key")->asStringOr("");
-                ev.outcome = ri.get("outcome")->asStringOr("");
-                ev.target = ri.get("target")->asStringOr("");
-                ev.rule = ri.get("rule")->asStringOr("");
-                ev.reason = ri.get("reason")->asStringOr("");
-                ev.size = (uint64_t)ri.get("size")->asNumberOr(0);
+                ev.replication = ri.find("replication")->asString("");
+                ev.kind = ri.find("kind")->asString("object");
+                ev.bucket = ri.find("bucket")->asString("");
+                ev.key = ri.find("key")->asString("");
+                ev.outcome = ri.find("outcome")->asString("");
+                ev.target = ri.find("target")->asString("");
+                ev.rule = ri.find("rule")->asString("");
+                ev.reason = ri.find("reason")->asString("");
+                ev.size = (uint64_t)ri.find("size")->asInt(0);
                 std::string cursor = ev.replication + "|" + ev.kind + "|" + std::to_string(ev.atSec) + "|" + ev.key;
                 if (!lastKey.empty() && cursor == lastKey) break; // caught up
                 emit(ev);

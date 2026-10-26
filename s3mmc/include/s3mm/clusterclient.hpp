@@ -181,7 +181,7 @@ public:
     Result<void> ensureRemoteSocket(const std::string& clusterId);
     /// Foreign clusters referenced by our own replication rules (destination
     /// or source that we do not own locally) — the "required" socket set.
-    std::vector<std::string> requiredClustersLocked() const;
+    std::vector<std::string> requiredClustersLocked();
     /// Current s3mmc.conf text read from disk (empty + false on failure).
     bool currentConfigText(std::string* text, std::string* error) const;
     /// Validate `text` and persist it over the live config file, then apply
@@ -309,7 +309,7 @@ private:
     Value onConfigSet(const std::string& peerId, const Value& frame);
     Value onCredRequest(const std::string& peerId, const Value& frame);
     void onManagerReply(const std::string& peerId, const Value& frame);
-    static Value makeManagerReply(const std::string& type, const Value& frame,
+    Value makeManagerReply(const std::string& type, const Value& frame,
                                   bool ok, const std::string& status,
                                   const std::string& reason, const Value* result);
 

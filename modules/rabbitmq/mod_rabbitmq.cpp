@@ -24,6 +24,14 @@
 #include "s3mme/broker.hpp"
 
 namespace {
+static std::string getCfgString(const s3mm::Value& cfg, const char* key, const std::string& def = {}) {
+    if (auto* v = cfg.find(key)) return v->asString(def);
+    return def;
+}
+static int getCfgInt(const s3mm::Value& cfg, const char* key, int def = 0) {
+    if (auto* v = cfg.find(key)) return (int)v->asInt(def);
+    return def;
+}
 
 // ------------------------------------------------------------ writers
 class Buf {
@@ -36,6 +44,9 @@ public:
     void bits(bool first, bool second = false) { u8((first ? 1 : 0) | (second ? 2 : 0)); }
     void raw(const std::string& s) { b_.append(s); }
     const std::string& str() const { return b_; }
+    size_t size() const { return b_.size(); }
+private:
+    std::string b_;
 };
 
 class Rdr {
@@ -121,16 +132,16 @@ public:
     const char* name() const override { return "rabbitmq"; }
 
     s3mm::Result<void> connect(const s3mm::Value& cfg) override {
-        host_ = cfg.getString("host", "localhost");
-        port_ = (int)cfg.getInt("port", 5672);
-        vhost_ = cfg.getString("vhost", "/");
-        user_ = cfg.getString("user", "guest");
-        pass_ = cfg.getString("pass", "guest");
-        exchange_ = cfg.getString("exchange", "");   // empty => default exchange
-        routingKey_ = cfg.getString("routing_key", "s3mm.events");
-        declareExchange_ = cfg.getString("declare_exchange") == "on";
-        exchangeType_ = cfg.getString("exchange_type", "topic");
-        confirm_ = cfg.getString("confirm") == "on";
+        host_ = getCfgString(cfg, "host", "localhost");
+        port_ = (int)getCfgInt(cfg, "port", 5672);
+        vhost_ = getCfgString(cfg, "vhost", "/");
+        user_ = getCfgString(cfg, "user", "guest");
+        pass_ = getCfgString(cfg, "pass", "guest");
+        exchange_ = getCfgString(cfg, "exchange", "");   // empty => default exchange
+        routingKey_ = getCfgString(cfg, "routing_key", "s3mm.events");
+        declareExchange_ = getCfgString(cfg, "declare_exchange") == "on";
+        exchangeType_ = getCfgString(cfg, "exchange_type", "topic");
+        confirm_ = getCfgString(cfg, "confirm") == "on";
 
         std::string err;
         fd_ = tcpConnect(host_, port_, err);
@@ -193,7 +204,7 @@ private:
 
     bool expectMethod(uint16_t cls, uint16_t method, std::string& err) {
         for (int guard = 0; guard < 32; ++guard) {
-            Rdr body;
+            Rdr body(std::string{});
             uint16_t ch = 0;
             uint8_t type = 0;
             if (!readFrame(body, ch, type, err)) return false;
@@ -216,7 +227,7 @@ private:
 
         // Connection.Start (10,10) -> Start-Ok (10,11)
         {
-            Rdr body; uint16_t ch; uint8_t type;
+            Rdr body(std::string{}); uint16_t ch; uint8_t type;
             if (!readFrame(body, ch, type, err)) return false;
             if (type != FRAME_METHOD) { err = "expected method frame"; return false; }
             // skip class/method/version/mechanisms/locale — we assume PLAIN is offered
@@ -324,7 +335,7 @@ private:
             if (!sendAll(fd_, bf.str())) { err = "body frame send failed"; return false; }
         }
         if (confirm_) {
-            Rdr body; uint16_t ch; uint8_t type;
+            Rdr body(std::string{}); uint16_t ch; uint8_t type;
             if (!readFrame(body, ch, type, err)) return false;
             if (type == FRAME_METHOD) {
                 uint16_t cls = body.u16();
