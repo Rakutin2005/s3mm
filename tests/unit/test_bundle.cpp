@@ -115,3 +115,17 @@ s3mm {
     std::string dumped = bundle.value().dump();
     CHECK(dumped.find("policy p") != std::string::npos);
 }
+
+TEST(bundle_fromnode_default_redirect) {
+    auto noTarget = config::Config::parse("policy p { default_action object redirect; }\n");
+    CHECK(noTarget);
+    auto bad = Bundle::fromNode(*noTarget.value().s3mm()->find("policy"));
+    CHECK(!bad);
+    CHECK(bad.error().find("redirect") != std::string::npos);
+
+    auto withTarget = config::Config::parse("policy p { default_action object redirect special-batch; }\n");
+    CHECK(withTarget);
+    auto good = Bundle::fromNode(*withTarget.value().s3mm()->find("policy"));
+    CHECK(good);
+    CHECK_EQ(good.value().defaultAction(Category::Object).positional, std::string("special-batch"));
+}

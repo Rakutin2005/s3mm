@@ -1,0 +1,22 @@
+[Unit]
+Description=s3mm event broker client (s3mme): publishes routing events to Kafka/RabbitMQ
+After=network-online.target s3mmd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/s3mme -c /etc/s3mm/s3mme.conf
+# s3mme has no live reload: apply configuration changes with a restart.
+Restart=on-failure
+RestartSec=5
+# run_dir (default /var/run/s3mme): control socket and pid file
+RuntimeDirectory=s3mme
+RuntimeDirectoryPreserve=yes
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/run/s3mm
+PrivateTmp=true
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

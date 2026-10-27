@@ -2,6 +2,7 @@
 
 #include <algorithm>
 
+#include "s3mm/common/log.hpp"
 #include "s3mm/common/str.hpp"
 #include "s3mm/common/value.hpp"
 #include "s3mm/common/zip.hpp"
@@ -40,30 +41,51 @@ void addGroupList(Account& account, const Value& value) {
 } // namespace
 
 Result<std::vector<Account>> parseIamExport(std::string_view archive, const std::string& vendor) {
+    LOG_DEBUG(vendor, " export-iam: parsing archive (", archive.size(), " bytes)");
     auto usersRaw = zip::extractFile(archive, "iam-assets/users.json");
-    if (!usersRaw)
+    if (!usersRaw) {
+        LOG_ERROR(vendor, " export-iam: cannot extract iam-assets/users.json: ", usersRaw.error());
         return Result<std::vector<Account>>::failure(vendor + " export-iam: " + usersRaw.error());
+    }
     std::string err;
     Value users = Value::parseJson(usersRaw.value(), &err);
-    if (!err.empty() || !users.isObject())
+    if (!err.empty() || !users.isObject()) {
+        LOG_ERROR(vendor, " export-iam: unparseable users.json: ", err.empty() ? "not an object" : err, " (",
+                  usersRaw.value().size(), " bytes)");
         return Result<std::vector<Account>>::failure(vendor + " export-iam: unparseable users.json: " + err);
+    }
 
     Value mappings;
     if (auto mappingRaw = zip::extractFile(archive, "iam-assets/user_mappings.json")) {
         std::string mappingErr;
         mappings = Value::parseJson(mappingRaw.value(), &mappingErr);
-        if (!mappingErr.empty() || !mappings.isObject()) mappings = Value::null();
+        if (!mappingErr.empty() || !mappings.isObject()) {
+            LOG_WARN(vendor, " export-iam: ignoring unparseable user_mappings.json: ",
+                     mappingErr.empty() ? "not an object" : mappingErr);
+            mappings = Value::null();
+        }
+    } else {
+        LOG_DEBUG(vendor, " export-iam: no user_mappings.json in archive");
     }
     Value groups;
     if (auto groupsRaw = zip::extractFile(archive, "iam-assets/groups.json")) {
         std::string groupsErr;
         groups = Value::parseJson(groupsRaw.value(), &groupsErr);
-        if (!groupsErr.empty() || !groups.isObject()) groups = Value::null();
+        if (!groupsErr.empty() || !groups.isObject()) {
+            LOG_WARN(vendor, " export-iam: ignoring unparseable groups.json: ",
+                     groupsErr.empty() ? "not an object" : groupsErr);
+            groups = Value::null();
+        }
+    } else {
+        LOG_DEBUG(vendor, " export-iam: no groups.json in archive");
     }
 
     std::vector<Account> out;
     for (const auto& [key, info] : users.members()) {
-        if (!info.isObject()) continue;
+        if (!info.isObject()) {
+            LOG_WARN(vendor, " export-iam: user entry '", key, "' is not an object, skipped");
+            continue;
+        }
         Account a;
         a.accessKey = info.getString("accessKey", key);
         if (a.accessKey.empty()) a.accessKey = key;
@@ -78,6 +100,9 @@ Result<std::vector<Account>> parseIamExport(std::string_view archive, const std:
             if (const Value* p = mapping->find("policies")) addPolicyList(a, *p);
             if (const Value* g = mapping->find("groups")) addGroupList(a, *g);
         }
+        LOG_DEBUG(vendor, " export-iam: account ", a.accessKey, " status=", a.status, " secret=",
+                  a.hasSecret ? log::redact(a.secretKey) : std::string("none"), " policies=",
+                  str::join(a.policies, ","), " groups=", str::join(a.groups, ","));
         if (!a.accessKey.empty()) out.push_back(std::move(a));
     }
 
@@ -99,6 +124,7 @@ Result<std::vector<Account>> parseIamExport(std::string_view archive, const std:
             }
         }
     }
+    LOG_INFO(vendor, " export-iam: parsed ", out.size(), " account(s)", groups.isObject() ? " with groups" : "");
     return Result<std::vector<Account>>(std::move(out));
 }
 

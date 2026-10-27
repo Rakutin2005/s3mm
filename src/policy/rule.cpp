@@ -2,6 +2,7 @@
 
 #include <algorithm>
 
+#include "s3mm/common/log.hpp"
 #include "s3mm/common/str.hpp"
 #include "s3mm/policy/lexer.hpp"
 
@@ -59,11 +60,6 @@ std::string Rule::toString() const {
 }
 
 // ------------------------------------------------------------------- parse --
-
-static bool isTerminalAction(const Action& a) {
-    const ActionSpec* spec = findActionSpec(a.name);
-    return spec && spec->terminal;
-}
 
 static Result<void> validateActions(const std::vector<Action>& actions) {
     if (actions.empty()) return Result<void>("rule has no actions (use 'action accept|drop|...')");
@@ -158,9 +154,13 @@ Result<Rule> Rule::parse(Category category, const std::vector<std::string>& toke
     try {
         Cursor cur{condTokens};
         auto expr = parseExpression(cur, scope, {});
-        if (!cur.empty()) return Result<Rule>::failure("unexpected token in condition: '" + cur.peek() + "'");
+        if (!cur.empty()) {
+            LOG_DEBUG("rule parse: unexpected token '", cur.peek(), "' in condition of: ", rule.source);
+            return Result<Rule>::failure("unexpected token in condition: '" + cur.peek() + "'");
+        }
         rule.condition = expr; // nullptr = match all
     } catch (const Error& e) {
+        LOG_DEBUG("rule parse: condition error in: ", rule.source, ": ", e.what());
         return Result<Rule>::failure(e.what());
     }
 
@@ -192,8 +192,12 @@ Result<Rule> Rule::parse(Category category, const std::vector<std::string>& toke
     }
 
     auto err = validateActions(actions);
-    if (!err) return Result<Rule>::failure(err.error());
+    if (!err) {
+        LOG_DEBUG("rule parse: invalid actions in: ", rule.source, ": ", err.error());
+        return Result<Rule>::failure(err.error());
+    }
     rule.actions = std::move(actions);
+    LOG_DEBUG("rule parsed: ", rule.toString());
     return Result<Rule>(std::move(rule));
 }
 
@@ -202,6 +206,7 @@ Result<Rule> Rule::parseLine(const std::string& line) {
     try {
         tokens = str::tokenize(line);
     } catch (const Error& e) {
+        LOG_DEBUG("rule parse: cannot tokenize '", log::clip(line), "': ", e.what());
         return Result<Rule>::failure(e.what());
     }
     if (tokens.empty()) return Result<Rule>::failure("empty rule line");

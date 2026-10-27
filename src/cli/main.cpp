@@ -6,6 +6,7 @@
 #include "s3mm/cli/commands.hpp"
 #include "s3mm/cli/render.hpp"
 #include "s3mm/common/error.hpp"
+#include "s3mm/common/log.hpp"
 
 #ifndef S3MM_VERSION
 #define S3MM_VERSION "0.0.0"
@@ -27,6 +28,7 @@ Parsed parseGlobal(int argc, char** argv) {
         const std::string a = argv[i];
         auto value = [&](const std::string& opt) -> std::string {
             if (i + 1 >= argc) {
+                LOG_ERROR("option ", opt, " requires an argument");
                 std::fprintf(stderr, "s3mm: option %s requires an argument\n", opt.c_str());
                 p.failed = true;
                 return {};
@@ -68,18 +70,31 @@ Parsed parseGlobal(int argc, char** argv) {
 } // namespace
 
 int main(int argc, char** argv) {
+    s3mm::log::Options logOptions;
+    logOptions.ident = "s3mm";
+    logOptions.facility = s3mm::log::Facility::User;
+    s3mm::log::init(logOptions);
+
     Parsed p = parseGlobal(argc, argv);
-    if (p.failed) return 2;
+    if (p.failed) {
+        LOG_ERROR("invalid command line, exiting with status 2");
+        return 2;
+    }
     try {
-        return s3mm::cli::runCommand(p.opts, p.rest);
+        int rc = s3mm::cli::runCommand(p.opts, p.rest);
+        LOG_INFO("exiting with status ", rc);
+        return rc;
     } catch (const s3mm::UsageError& e) {
+        LOG_ERROR("usage error: ", e.what());
         std::fprintf(stderr, "s3mm: %s\n", e.what());
         std::fprintf(stderr, "Try 's3mm --help' for more information.\n");
         return 2;
     } catch (const s3mm::Error& e) {
+        LOG_ERROR("command failed: ", e.what());
         std::fprintf(stderr, "s3mm: %s\n", e.what());
         return 1;
     } catch (const std::exception& e) {
+        LOG_ERROR("command failed with exception: ", e.what());
         std::fprintf(stderr, "s3mm: %s\n", e.what());
         return 1;
     }

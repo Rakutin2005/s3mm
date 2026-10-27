@@ -4,6 +4,7 @@
 
 #include "s3mm/common/error.hpp"
 #include "s3mm/common/fs.hpp"
+#include "s3mm/common/log.hpp"
 #include "s3mm/common/secret.hpp"
 #include "s3mm/common/str.hpp"
 #include "s3mm/common/units.hpp"
@@ -164,6 +165,7 @@ Value clusterValue(const Cluster& c) {
     v.set("retries", Value::number((int64_t)c.retries));
     v.set("description", Value::str(c.description));
     v.set("managed", c.managed ? Value::boolean(true) : Value::boolean(false));
+    v.set("admin_endpoint", strArray(c.adminEndpoints));
     return v;
 }
 
@@ -274,8 +276,8 @@ Value settingsValue(const Settings& s) {
 
 // -------------------------------------------------------------- mutations ----
 
-Value mutateEntity(Registry& r, const std::string& cmd, const std::string& kindRaw,
-                   const std::string& nameIn, const Value& fields) {
+static Value mutateEntityImpl(Registry& r, const std::string& cmd, const std::string& kindRaw,
+                              const std::string& nameIn, const Value& fields) {
     const bool isAdd = cmd == "add", isEdit = cmd == "edit", isRm = cmd == "rm";
     if (!isAdd && !isEdit && !isRm)
         throw UsageError("mutate: unknown command '" + cmd + "'");
@@ -365,6 +367,7 @@ Value mutateEntity(Registry& r, const std::string& cmd, const std::string& kindR
         if (has(fields, "retries")) c.retries = (int)fint(fields, "retries", c.retries);
         if (has(fields, "description")) c.description = fstr(fields, "description", c.description);
         if (has(fields, "managed")) c.managed = fbool(fields, "managed", c.managed);
+        if (has(fields, "admin_endpoint")) c.adminEndpoints = flist(fields, "admin_endpoint");
         Result<void> res = isAdd ? r.addCluster(c) : r.updateCluster(name, c);
         if (!res) throw Error(res.error());
         return clusterValue(c);
@@ -395,9 +398,13 @@ Value mutateEntity(Registry& r, const std::string& cmd, const std::string& kindR
             fs::mkdirp(st.secretsDir);
             std::string path = fs::joinPath(st.secretsDir, name);
             std::string body = st.masterKey.empty() ? plain : secret::seal(plain, st.masterKey);
-            if (!fs::writeFileAtomic(path, body + "\n"))
+            if (!fs::writeFileAtomic(path, body + "\n")) {
+                LOG_ERROR("credential '", name, "': cannot write secret file ", path);
                 throw Error("cannot write secret file " + path);
+            }
             fs::setPermissions(path, 0400);
+            LOG_INFO("credential '", name, "': secret ", log::redact(plain), " written to ", path,
+                     st.masterKey.empty() ? " (plain)" : " (sealed with the master key)");
             c.secretKey = plain;
             c.secretIsPlain = false;
         };
@@ -405,9 +412,10 @@ Value mutateEntity(Registry& r, const std::string& cmd, const std::string& kindR
         if (!sec.empty()) materialize(sec);
         std::string secFile = fstr(fields, "secret_file");
         if (!secFile.empty()) {
+            LOG_DEBUG("credential '", name, "': reading secret from ", secFile);
             auto content = fs::readSecretFile(secFile);
-            if (!content) throw Error("secret_file: " + content.value_or("unreadable"));
-            std::string plain = str::trim(*content);
+            if (!content) throw Error("secret_file: " + content.error());
+            std::string plain = str::trim(content.value());
             if (secret::isPemBlock(plain)) {
                 if (r.settings().masterKey.empty())
                     throw Error("sealed secret_file requires a configured master_key");
@@ -507,9 +515,9 @@ Value mutateEntity(Registry& r, const std::string& cmd, const std::string& kindR
     throw UsageError(cmd + ": unknown kind '" + kind + "'");
 }
 
-Value applyRule(Registry& r, const std::string& action, const std::string& bundleName,
-                const std::string& ref, const std::string& line, const std::string& before,
-                const std::string& after) {
+static Value applyRuleImpl(Registry& r, const std::string& action, const std::string& bundleName,
+                           const std::string& ref, const std::string& line, const std::string& before,
+                           const std::string& after) {
     if (bundleName.empty()) throw UsageError("rule: 'policy' bundle name required");
     auto it = r.bundles().find(bundleName);
     if (it == r.bundles().end()) throw Error("no policy bundle '" + bundleName + "'");
@@ -553,6 +561,37 @@ Value applyRule(Registry& r, const std::string& action, const std::string& bundl
         return v;
     }
     throw UsageError("rule: unknown action '" + action + "'");
+}
+
+Value mutateEntity(Registry& r, const std::string& cmd, const std::string& kindRaw,
+                   const std::string& nameIn, const Value& fields) {
+    std::vector<std::string> keys;
+    if (fields.isObject())
+        for (const auto& [k, v] : fields.members()) keys.push_back(k);
+    LOG_DEBUG("registry: ", cmd, " ", kindRaw, " '", nameIn, "' fields=[", str::join(keys, ","), "]");
+    try {
+        Value out = mutateEntityImpl(r, cmd, kindRaw, nameIn, fields);
+        LOG_DEBUG("registry: ", cmd, " ", kindRaw, " '", nameIn, "' succeeded");
+        return out;
+    } catch (const Error& e) {
+        LOG_WARN("registry: ", cmd, " ", kindRaw, " '", nameIn, "' rejected: ", e.what());
+        throw;
+    }
+}
+
+Value applyRule(Registry& r, const std::string& action, const std::string& bundleName,
+                const std::string& ref, const std::string& line, const std::string& before,
+                const std::string& after) {
+    LOG_DEBUG("registry: rule ", action, " on policy '", bundleName, "' ref='", ref, "' line='", line, "' before='",
+              before, "' after='", after, "'");
+    try {
+        Value out = applyRuleImpl(r, action, bundleName, ref, line, before, after);
+        LOG_DEBUG("registry: rule ", action, " on policy '", bundleName, "' succeeded");
+        return out;
+    } catch (const Error& e) {
+        LOG_WARN("registry: rule ", action, " on policy '", bundleName, "' rejected: ", e.what());
+        throw;
+    }
 }
 
 } // namespace s3mm::registry

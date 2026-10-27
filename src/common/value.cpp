@@ -273,7 +273,7 @@ struct JsonParser {
 } // namespace
 
 Value Value::parseJson(std::string_view text, std::string* error) {
-    JsonParser p{text};
+    JsonParser p{text, 0, {}};
     Value out;
     if (!p.parseValue(out, 0)) {
         if (error) *error = p.error;

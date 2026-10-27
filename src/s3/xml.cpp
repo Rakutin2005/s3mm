@@ -3,6 +3,7 @@
 #include <cctype>
 #include <cstring>
 
+#include "s3mm/common/log.hpp"
 #include "s3mm/common/str.hpp"
 
 namespace s3mm::xml {
@@ -180,24 +181,30 @@ struct Parser {
 
 } // namespace
 
+static Result<Element> parseFailure(const std::string& document, size_t pos, const std::string& why) {
+    if (document.empty()) LOG_DEBUG("xml: cannot parse empty document: ", why);
+    else LOG_WARN("xml: parse failure at offset ", pos, " of ", document.size(), " bytes: ", why, "; document: ", log::clip(document, 200));
+    return Result<Element>::failure(why);
+}
+
 Result<Element> parse(const std::string& document) {
-    Parser p{document};
+    Parser p{document, 0, {}};
     // skip prologue
     p.skipWs();
     while (!p.eof() && p.peek() == '<') {
         if (p.doc.substr(p.pos, 2) == "<?") {
-            if (!p.skipUntil("?>")) return Result<Element>::failure("unterminated XML prologue");
+            if (!p.skipUntil("?>")) return parseFailure(document, p.pos, "unterminated XML prologue");
         } else if (p.doc.substr(p.pos, 9) == "<!DOCTYPE") {
-            if (!p.skipUntil(">")) return Result<Element>::failure("unterminated DOCTYPE");
+            if (!p.skipUntil(">")) return parseFailure(document, p.pos, "unterminated DOCTYPE");
         } else if (p.doc.substr(p.pos, 4) == "<!--") {
-            if (!p.skipUntil("-->")) return Result<Element>::failure("unterminated comment");
+            if (!p.skipUntil("-->")) return parseFailure(document, p.pos, "unterminated comment");
         } else {
             break;
         }
         p.skipWs();
     }
     Element root;
-    if (!p.parseElement(root)) return Result<Element>::failure(p.error);
+    if (!p.parseElement(root)) return parseFailure(document, p.pos, p.error);
     return Result<Element>(std::move(root));
 }
 

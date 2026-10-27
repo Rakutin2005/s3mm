@@ -4,6 +4,7 @@
 #include <set>
 #include <sstream>
 
+#include "s3mm/common/log.hpp"
 #include "s3mm/common/str.hpp"
 #include "s3mm/policy/lexer.hpp"
 
@@ -46,11 +47,15 @@ static void sortByOrder(std::vector<Rule>& rules) {
 Result<void> Bundle::addRule(Rule rule, const std::string& before, const std::string& after) {
     if (rule.name.empty() && findRule(std::to_string(rule.order))) {
         // explicit duplicate order: move to the end
+        LOG_DEBUG("policy '", name, "': rule number ", rule.order, " taken, renumbering to ", nextOrder());
         rule.order = nextOrder();
     }
     if (!before.empty()) {
         const Rule* ref = findRule(before);
-        if (!ref) return Result<void>("no rule '" + before + "' in policy '" + name + "'");
+        if (!ref) {
+            LOG_ERROR("policy '", name, "': add rule: no rule '", before, "' to insert before");
+            return Result<void>("no rule '" + before + "' in policy '" + name + "'");
+        }
         int refOrder = ref->order;
         int prevOrder = 0;
         for (const auto& r : rules)
@@ -67,7 +72,10 @@ Result<void> Bundle::addRule(Rule rule, const std::string& before, const std::st
         rule.order = candidate;
     } else if (!after.empty()) {
         const Rule* ref = findRule(after);
-        if (!ref) return Result<void>("no rule '" + after + "' in policy '" + name + "'");
+        if (!ref) {
+            LOG_ERROR("policy '", name, "': add rule: no rule '", after, "' to insert after");
+            return Result<void>("no rule '" + after + "' in policy '" + name + "'");
+        }
         int refOrder = ref->order;
         int nextOrderVal = refOrder + 10;
         for (const auto& r : rules)
@@ -85,13 +93,17 @@ Result<void> Bundle::addRule(Rule rule, const std::string& before, const std::st
     } else if (rule.order == 0) {
         rule.order = nextOrder();
     } else if (findRuleByOrder(rule.order)) {
+        LOG_ERROR("policy '", name, "': rule number ", rule.order, " already exists");
         return Result<void>("rule with number " + std::to_string(rule.order) + " already exists in policy '" + name + "'");
     }
     if (!rule.name.empty()) {
         for (const auto& r : rules)
-            if (!rule.name.empty() && r.name == rule.name)
+            if (!rule.name.empty() && r.name == rule.name) {
+                LOG_ERROR("policy '", name, "': rule named '", rule.name, "' already exists");
                 return Result<void>("rule named '" + rule.name + "' already exists in policy '" + name + "'");
+            }
     }
+    LOG_DEBUG("policy '", name, "': rule added: ", rule.toString());
     rules.push_back(std::move(rule));
     sortByOrder(rules);
     return Result<void>::success();
@@ -99,8 +111,12 @@ Result<void> Bundle::addRule(Rule rule, const std::string& before, const std::st
 
 Result<void> Bundle::removeRule(const std::string& nameOrNumber) {
     const Rule* r = findRule(nameOrNumber);
-    if (!r) return Result<void>("no rule '" + nameOrNumber + "' in policy '" + name + "'");
+    if (!r) {
+        LOG_ERROR("policy '", name, "': remove rule: no rule '", nameOrNumber, "'");
+        return Result<void>("no rule '" + nameOrNumber + "' in policy '" + name + "'");
+    }
     int order = r->order;
+    LOG_DEBUG("policy '", name, "': rule removed: ", r->toString());
     rules.erase(std::remove_if(rules.begin(), rules.end(),
                                [&](const Rule& x) { return x.order == order; }),
                 rules.end());
@@ -109,9 +125,13 @@ Result<void> Bundle::removeRule(const std::string& nameOrNumber) {
 
 Result<void> Bundle::replaceRule(const std::string& nameOrNumber, Rule rule) {
     const Rule* r = findRule(nameOrNumber);
-    if (!r) return Result<void>("no rule '" + nameOrNumber + "' in policy '" + name + "'");
+    if (!r) {
+        LOG_ERROR("policy '", name, "': replace rule: no rule '", nameOrNumber, "'");
+        return Result<void>("no rule '" + nameOrNumber + "' in policy '" + name + "'");
+    }
     int order = r->order;
     std::string oldName = r->name;
+    LOG_DEBUG("policy '", name, "': rule ", order, " replaced: ", r->toString(), " => ", rule.toString());
     rule.order = order;
     if (rule.name.empty()) rule.name = oldName;
     for (auto& existing : rules)
@@ -137,6 +157,7 @@ static Action defaultDrop() {
 Bundle Bundle::builtin(const std::string& name) {
     Bundle b;
     b.name = name;
+    LOG_DEBUG("using built-in policy '", name, "' (", name == "drop-all" ? "drop" : "accept", " everything)");
     if (name == "drop-all") {
         b.defaults[Category::Access] = defaultDrop();
         b.defaults[Category::Bucket] = defaultDrop();
@@ -166,62 +187,83 @@ std::string Bundle::dump(int indent) const {
 Result<Bundle> Bundle::fromNode(const config::Node& node) {
     Bundle b;
     b.name = node.argOr(0);
-    if (b.name.empty()) return Result<Bundle>::failure("policy block requires a name");
+    if (b.name.empty()) {
+        LOG_ERROR(node.file, ":", node.line, ": policy block requires a name");
+        return Result<Bundle>::failure("policy block requires a name");
+    }
+    log::Stopwatch sw;
+    LOG_DEBUG("compiling policy '", b.name, "' from ", node.file, ":", node.line, " (", node.children.size(),
+              " directive(s))");
+    auto fail = [&](const std::string& msg) {
+        LOG_ERROR("policy '", b.name, "': ", msg);
+        return Result<Bundle>::failure(msg);
+    };
     for (const auto& c : node.children) {
         if (c.name == "default_action") {
             if (c.args.size() < 2)
-                return Result<Bundle>::failure(c.file + ":" + std::to_string(c.line) + ": default_action requires <category> <action>");
+                return fail(c.file + ":" + std::to_string(c.line) + ": default_action requires <category> <action>");
             auto cat = categoryFromString(c.args[0]);
             if (!cat)
-                return Result<Bundle>::failure(c.file + ":" + std::to_string(c.line) + ": unknown category '" + c.args[0] + "'");
+                return fail(c.file + ":" + std::to_string(c.line) + ": unknown category '" + c.args[0] + "'");
             Action a;
             a.name = c.args[1];
             if (!findActionSpec(a.name))
-                return Result<Bundle>::failure(c.file + ":" + std::to_string(c.line) + ": unknown action '" + a.name + "'");
+                return fail(c.file + ":" + std::to_string(c.line) + ": unknown action '" + a.name + "'");
             for (size_t i = 2; i < c.args.size(); ++i) {
                 auto eq = c.args[i].find('=');
                 if (eq == std::string::npos) {
-                    if (findActionSpec(c.args[i]) && a.positional.empty() &&
-                        findActionSpec(a.name)->positional)
+                    if (a.positional.empty() && findActionSpec(a.name)->positional)
                         a.positional = c.args[i];
                     else
-                        return Result<Bundle>::failure(c.file + ":" + std::to_string(c.line) + ": expected key=value, got '" + c.args[i] + "'");
+                        return fail(c.file + ":" + std::to_string(c.line) + ": expected key=value, got '" + c.args[i] + "'");
                 } else {
                     a.params[c.args[i].substr(0, eq)] = c.args[i].substr(eq + 1);
                 }
             }
+            if (a.name == "redirect" && a.positional.empty())
+                return fail(c.file + ":" + std::to_string(c.line) +
+                            ": default_action redirect requires a target batch name: redirect <batch>");
+            LOG_DEBUG("policy '", b.name, "': default_action ", categoryName(*cat), " ", a.toString());
             b.defaults[*cat] = std::move(a);
             continue;
         }
         if (c.name == "default_route") {
             if (c.args.size() < 2)
-                return Result<Bundle>::failure(c.file + ":" + std::to_string(c.line) + ": default_route requires <outcome> <target>");
+                return fail(c.file + ":" + std::to_string(c.line) + ": default_route requires <outcome> <target>");
             const std::string& outcome = c.args[0];
             const std::string& target = c.args[1];
             if (outcome == "denied") b.routes.denied = target;
             else if (outcome == "warning") b.routes.warning = target;
             else if (outcome == "success") b.routes.success = target;
             else
-                return Result<Bundle>::failure(c.file + ":" + std::to_string(c.line) + ": default_route outcome must be denied|warning|success");
+                return fail(c.file + ":" + std::to_string(c.line) + ": default_route outcome must be denied|warning|success");
+            LOG_DEBUG("policy '", b.name, "': default_route ", outcome, " -> ", target);
             continue;
         }
         if (c.name == "rule") {
             Result<Rule> parsed = c.args.size() == 1
                 ? Rule::parseLine(c.args[0])
                 : Rule::parse(Category::Object, c.args);
-            if (!parsed) return Result<Bundle>::failure(c.file + ":" + std::to_string(c.line) + ": " + parsed.error());
+            if (!parsed) return fail(c.file + ":" + std::to_string(c.line) + ": " + parsed.error());
             Rule rule = parsed.value();
             rule.file = c.file;
             rule.line = c.line;
             auto res = b.addRule(std::move(rule));
-            if (!res) return Result<Bundle>::failure(c.file + ":" + std::to_string(c.line) + ": " + res.error());
+            if (!res) return fail(c.file + ":" + std::to_string(c.line) + ": " + res.error());
             continue;
         }
         if (c.name == "include") continue;
-        return Result<Bundle>::failure(c.file + ":" + std::to_string(c.line) + ": unknown directive '" + c.name + "' inside policy block");
+        return fail(c.file + ":" + std::to_string(c.line) + ": unknown directive '" + c.name + "' inside policy block");
     }
     for (auto cat : {Category::Access, Category::Bucket, Category::Object})
-        if (!b.defaults.count(cat)) b.defaults[cat] = Action{"accept", {}, {}};
+        if (!b.defaults.count(cat)) {
+            LOG_DEBUG("policy '", b.name, "': no default_action for ", categoryName(cat), ", using accept");
+            b.defaults[cat] = Action{"accept", {}, {}};
+        }
+    LOG_INFO("policy '", b.name, "' compiled: ", b.rules.size(), " rule(s) (acl=", b.rulesOf(Category::Access).size(),
+             " bucket=", b.rulesOf(Category::Bucket).size(), " object=", b.rulesOf(Category::Object).size(),
+             "), routes success=", b.routes.success.empty() ? "<replication>-rqueue" : b.routes.success, " denied=",
+             b.routes.denied, " warning=", b.routes.warning, " in ", sw.ms(), " ms");
     return Result<Bundle>(std::move(b));
 }
 

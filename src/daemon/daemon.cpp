@@ -8,6 +8,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <chrono>
 #include <sstream>
 
 #include "s3mm/common/error.hpp"
@@ -20,6 +22,7 @@
 #include "s3mm/daemon/metrics.hpp"
 #include "s3mm/daemon/server.hpp"
 #include "s3mm/registry/mutate.hpp"
+#include "s3mm/replication/probe.hpp"
 
 #ifndef S3MM_VERSION
 #define S3MM_VERSION "0.0.0"
@@ -167,36 +170,109 @@ Value moduleValue(const module::ModuleInfo& i) {
     return v;
 }
 
+/// Request summary for the log: command, kind, name and field names only
+/// (field values may carry secrets).
+std::string describeRequest(const Value& req) {
+    std::string out = "cmd=" + req.getString("cmd");
+    for (const char* k : {"kind", "name", "replication", "policy", "action", "path"}) {
+        const Value* v = req.find(k);
+        if (v && v->isString() && !v->asString().empty()) out += std::string(" ") + k + "=" + v->asString();
+    }
+    const Value* f = req.find("fields");
+    if (f && f->isObject() && f->size() > 0) {
+        std::vector<std::string> keys;
+        for (const auto& [k, v] : f->members()) keys.push_back(k);
+        out += " fields=[" + str::join(keys, ",") + "]";
+    }
+    return out;
+}
+
 } // namespace
 
 Daemon::Daemon(Options options) : options_(std::move(options)) {}
 
 Daemon::~Daemon() {
+    waitForProbes();
     stopServers();
     removePidFile();
+    if (signalFd_ >= 0) ::close(signalFd_);
+    if (gSignalFd >= 0) ::close(gSignalFd);
+    signalFd_ = gSignalFd = -1;
 }
 
+// Both requests go through the self-pipe so that they are handled by the
+// main loop, exactly like the corresponding signals.
 void Daemon::requestStop() {
+    LOG_DEBUG("stop requested");
     char c = 'q';
-    if (signalFd_ >= 0) {
-        ssize_t ignored = ::write(signalFd_, &c, 1);
-        (void)ignored;
-    }
+    if (gSignalFd < 0 || ::write(gSignalFd, &c, 1) != 1) LOG_ERROR("stop request could not be queued: signal pipe unavailable");
 }
 
-void Daemon::requestReload() { requestStop(); } // real implementation via SIGHUP path
+void Daemon::requestReload() {
+    LOG_DEBUG("reload requested");
+    char c = SIGHUP;
+    if (gSignalFd < 0 || ::write(gSignalFd, &c, 1) != 1) LOG_ERROR("reload request could not be queued: signal pipe unavailable");
+}
 
 void Daemon::requestKick() {}
+
+// ---------------------------------------------------------- cluster probe ---
+
+void Daemon::probeClustersAsync(std::vector<std::string> names, const std::string& why) {
+    if (!registry_ || registry_->clusters().empty()) return;
+    auto snapshot = std::make_shared<registry::Registry>(*registry_);
+    if (names.empty())
+        for (const auto& c : snapshot->clusters()) names.push_back(c.name);
+    LOG_INFO("probe: checking ", names.size(), " cluster(s) in the background (", why, "): ", str::join(names, ", "));
+    std::lock_guard<std::mutex> lock(probesMutex_);
+    probes_.erase(std::remove_if(probes_.begin(), probes_.end(),
+                                 [](std::future<void>& f) {
+                                     return f.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+                                 }),
+                  probes_.end());
+    const module::Loader* loader = loader_.get();
+    probes_.push_back(std::async(std::launch::async, [snapshot, names, loader] {
+        for (const auto& name : names) {
+            const registry::Cluster* c = snapshot->cluster(name);
+            if (!c) {
+                LOG_WARN("probe: cluster '", name, "' disappeared before it could be checked");
+                continue;
+            }
+            repl::probeCluster(*snapshot, *c, loader);
+        }
+    }));
+}
+
+void Daemon::waitForProbes() {
+    std::lock_guard<std::mutex> lock(probesMutex_);
+    if (!probes_.empty()) LOG_DEBUG("probe: waiting for ", probes_.size(), " background probe(s)");
+    for (auto& f : probes_)
+        if (f.valid()) f.wait();
+    probes_.clear();
+}
 
 // ----------------------------------------------------------------- config ---
 
 Result<void> Daemon::loadConfig() {
+    log::Stopwatch sw;
+    LOG_DEBUG("loading configuration from ", options_.config);
     auto cfg = config::Config::load(options_.config);
-    if (!cfg) return Result<void>(cfg.error());
+    if (!cfg) {
+        LOG_ERROR("cannot load configuration ", options_.config, ": ", cfg.error());
+        return Result<void>(cfg.error());
+    }
     auto problems = cfg.value().validate();
-    if (!problems.empty()) return Result<void>(str::join(problems, "; "));
+    if (!problems.empty()) {
+        LOG_ERROR("configuration ", options_.config, " rejected: ", problems.size(), " problem(s): ",
+                  str::join(problems, "; "));
+        return Result<void>(str::join(problems, "; "));
+    }
+    LOG_DEBUG("configuration ", cfg.value().path(), " validated, building registry");
     auto registry = registry::Registry::fromConfig(cfg.value());
-    if (!registry) return Result<void>(registry.error());
+    if (!registry) {
+        LOG_ERROR("cannot build registry from ", options_.config, ": ", registry.error());
+        return Result<void>(registry.error());
+    }
 
     registry_ = std::make_unique<registry::Registry>(std::move(registry.value()));
     loadedConfigPath_ = cfg.value().path();
@@ -205,52 +281,77 @@ Result<void> Daemon::loadConfig() {
     loader_ = std::make_unique<module::Loader>();
     const auto& settings = registry_->settings();
     if (!settings.modulesDir.empty()) {
+        LOG_DEBUG("loading modules from configured modules_dir ", settings.modulesDir);
         auto loaded = loader_->loadDir(settings.modulesDir);
         if (!loaded) LOG_WARN("modules: ", loaded.error());
     } else {
+        LOG_DEBUG("modules_dir not set, loading modules from default locations");
         auto loaded = loader_->loadDefaults();
         if (!loaded) LOG_WARN("modules: ", loaded.error());
     }
     LOG_INFO("configuration loaded from ", options_.config, ": ", registry_->clusters().size(), " cluster(s), ",
              registry_->credentials().size(), " credential(s), ", registry_->replications().size(),
              " replication(s), ", registry_->targets().size(), " target(s), ", registry_->bundles().size(),
-             " policy bundle(s), modules: ", str::join(loader_->names(), ", "));
+             " policy bundle(s), modules: ", str::join(loader_->names(), ", "), " (", sw.ms(), " ms)");
+    LOG_DEBUG("settings: socket=", settings.socket, " pid_file=", settings.pidFile, " metrics=", settings.metricsListen,
+              " cache_dir=", settings.cacheDir, " secrets_dir=", settings.secretsDir, " log_level=", settings.logLevel,
+              " log_facility=", settings.logFacility, " log_socket=", settings.logSocket,
+              " permanent=", settings.permanent ? "yes" : "no",
+              " master_key=", settings.masterKey.empty() ? std::string("none") : log::redact(settings.masterKey));
     return Result<void>::success();
 }
 
 // --------------------------------------------------------------- lifecycle ---
 
 void Daemon::daemonize() {
+    LOG_DEBUG("daemonizing (pid ", ::getpid(), ")");
     pid_t pid = ::fork();
-    if (pid < 0) return;
+    if (pid < 0) {
+        LOG_ERROR("daemonize: first fork failed: ", std::strerror(errno), " — staying in the foreground");
+        return;
+    }
     if (pid > 0) ::_exit(0);
-    ::setsid();
+    if (::setsid() < 0) LOG_WARN("daemonize: setsid failed: ", std::strerror(errno));
     pid = ::fork();
-    if (pid < 0) return;
+    if (pid < 0) {
+        LOG_ERROR("daemonize: second fork failed: ", std::strerror(errno));
+        return;
+    }
     if (pid > 0) ::_exit(0);
     ::umask(0027);
-    if (::chdir("/") != 0) { /* non fatal */ }
+    if (::chdir("/") != 0) LOG_WARN("daemonize: chdir / failed: ", std::strerror(errno));
     int devNull = ::open("/dev/null", O_RDWR);
     if (devNull >= 0) {
         ::dup2(devNull, STDIN_FILENO);
         ::dup2(devNull, STDOUT_FILENO);
         ::dup2(devNull, STDERR_FILENO);
         if (devNull > STDERR_FILENO) ::close(devNull);
+    } else {
+        LOG_WARN("daemonize: cannot open /dev/null: ", std::strerror(errno));
     }
+    LOG_INFO("daemonized, running in the background as pid ", ::getpid());
 }
 
 void Daemon::writePidFile() {
     const std::string& pidFile = options_.pidFile.empty() ? registry_->settings().pidFile : options_.pidFile;
-    if (pidFile.empty()) return;
-    fs::mkdirp(fs::dirname(pidFile));
+    if (pidFile.empty()) {
+        LOG_DEBUG("no pid file configured");
+        return;
+    }
+    if (!fs::mkdirp(fs::dirname(pidFile))) LOG_WARN("cannot create pid file directory ", fs::dirname(pidFile));
     if (!fs::writeFileAtomic(pidFile, std::to_string(::getpid()) + "\n"))
         LOG_WARN("cannot write pid file ", pidFile);
+    else
+        LOG_INFO("pid file ", pidFile, " written (pid ", ::getpid(), ")");
 }
 
 void Daemon::removePidFile() {
     const std::string& pidFile =
         registry_ ? (options_.pidFile.empty() ? registry_->settings().pidFile : options_.pidFile) : options_.pidFile;
-    if (!pidFile.empty()) fs::removeFile(pidFile);
+    if (pidFile.empty()) return;
+    if (!fs::exists(pidFile)) return;
+    if (fs::removeFile(pidFile)) LOG_DEBUG("pid file ", pidFile, " removed");
+    else LOG_WARN("cannot remove pid file ", pidFile);
 }
 
 void Daemon::installSignals() {
@@ -269,27 +370,36 @@ void Daemon::installSignals() {
     sa.sa_handler = signalHandler;
     ::sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0; // no SA_RESTART: poll must return EINTR promptly
-    ::sigaction(SIGTERM, &sa, nullptr);
-    ::sigaction(SIGINT, &sa, nullptr);
-    ::sigaction(SIGHUP, &sa, nullptr);
-    ::sigaction(SIGUSR1, &sa, nullptr);
+    for (int sig : {SIGTERM, SIGINT, SIGHUP, SIGUSR1}) {
+        if (::sigaction(sig, &sa, nullptr) != 0)
+            LOG_ERROR("sigaction(", ::strsignal(sig), "): ", std::strerror(errno));
+    }
     ::signal(SIGPIPE, SIG_IGN);
+    LOG_DEBUG("signal handlers installed (TERM, INT, HUP, USR1; PIPE ignored)");
 }
 
 Result<void> Daemon::startServers() {
     const std::string& socket = options_.socket.empty() ? registry_->settings().socket : options_.socket;
     if (socket.find("://") != std::string::npos || (socket.find(':') != std::string::npos && socket.find('/') == std::string::npos)) {
+        LOG_ERROR("control socket '", socket, "' is not a Unix domain socket path");
         return Result<void>::failure("s3mmd control socket must be a Unix domain socket path, not a network address");
     }
+    LOG_DEBUG("starting control socket on ", socket);
     auto listened = gControl.listen(socket);
-    if (!listened) return listened;
-    LOG_INFO("control socket on ", socket);
+    if (!listened) {
+        LOG_ERROR("control socket ", socket, ": ", listened.error());
+        return listened;
+    }
+    LOG_NOTICE("control socket listening on ", socket);
 
     const std::string& metricsAddr = registry_->settings().metricsListen;
     if (!metricsAddr.empty()) {
+        LOG_DEBUG("starting metrics server on ", metricsAddr);
         auto bound = gMetrics.listen(metricsAddr);
         if (!bound) LOG_WARN("metrics: ", bound.error());
-        else LOG_INFO("metrics on http://", metricsAddr, "/metrics");
+        else LOG_NOTICE("metrics listening on http://", metricsAddr, "/metrics");
+    } else {
+        LOG_DEBUG("metrics_listen not set, metrics server disabled");
     }
     // Peer/cluster networking is delegated to the optional s3mmc cluster client
     // (s3mmc/ subproject). s3mmd only talks to remote clusters through their
@@ -298,13 +408,9 @@ Result<void> Daemon::startServers() {
 }
 
 void Daemon::stopServers() {
+    LOG_DEBUG("stopping control/metrics servers");
     gControl.close();
     gMetrics.close();
-    if (signalFd_ >= 0) {
-        ::close(signalFd_);
-        signalFd_ = -1;
-        gSignalFd = -1;
-    }
 }
 
 // -------------------------------------------------------------- main loop ---
@@ -328,16 +434,25 @@ void Daemon::mainLoop() {
             char c;
             while (::read(signalFd_, &c, 1) > 0) {
                 if (c == 'q') {
+                    LOG_NOTICE("stop requested internally");
                     running_ = false;
                     break;
                 }
                 if (c == SIGHUP) {
-                    LOG_INFO("SIGHUP: reloading configuration");
+                    LOG_NOTICE("SIGHUP: reloading configuration");
+                    log::Stopwatch sw;
                     auto res = reloadConfig();
                     if (!res) LOG_ERROR("reload failed: ", res.error(), " — keeping the previous configuration");
+                    else LOG_NOTICE("SIGHUP reload completed in ", sw.ms(), " ms");
                 } else if (c == SIGUSR1) {
-                    LOG_INFO("SIGUSR1: rescanning all replications");
+                    LOG_NOTICE("SIGUSR1: rescanning all replications");
                     engine_->kick();
+                } else if (c == SIGTERM || c == SIGINT) {
+                    LOG_NOTICE("received ", ::strsignal(c), ", shutting down");
+                    running_ = false;
+                    break;
+                } else {
+                    LOG_NOTICE("received signal ", (int)c, " (", ::strsignal(c), ")");
                 }
             }
         }
@@ -351,64 +466,82 @@ void Daemon::mainLoop() {
 }
 
 int Daemon::run() {
-    if (options_.daemonize) daemonize();
-
+    log::Stopwatch startup;
     log::Options logOptions;
     logOptions.ident = "s3mmd";
-    logOptions.toStderr = !options_.daemonize;
     log::init(logOptions);
+    LOG_NOTICE("s3mmd ", S3MM_VERSION, " starting (pid ", ::getpid(), ", config ", options_.config,
+               options_.daemonize ? ", daemonize" : "", options_.validateOnly ? ", validate only" : "",
+               options_.runOnce ? ", run once" : "", ")");
+    LOG_DEBUG("options: socket=", options_.socket.empty() ? "<settings>" : options_.socket,
+              " pid_file=", options_.pidFile.empty() ? "<settings>" : options_.pidFile);
+
+    if (options_.daemonize) daemonize();
 
     auto loaded = loadConfig();
     if (!loaded) {
-        LOG_ERROR("configuration error: ", loaded.error());
+        LOG_CRITICAL("configuration error: ", loaded.error());
         if (options_.validateOnly) {
             std::fprintf(stderr, "configuration error: %s\n", loaded.error().c_str());
             return 1;
         }
-        std::fprintf(stderr, "s3mmd: configuration error: %s\n", loaded.error().c_str());
         return 1;
     }
     if (options_.validateOnly) {
+        LOG_NOTICE("configuration OK: ", options_.config);
         std::fprintf(stdout, "configuration OK: %s\n", options_.config.c_str());
         return 0;
     }
 
     log::Options tuned;
     tuned.ident = "s3mmd";
-    tuned.toStderr = !options_.daemonize;
-    tuned.level = log::levelFromString(registry_->settings().logLevel);
+    try {
+        tuned.level = log::levelFromString(registry_->settings().logLevel);
+    } catch (const Error&) {
+        LOG_CRITICAL("unknown log level '", registry_->settings().logLevel, "'");
+        throw;
+    }
     if (!log::facilityFromString(registry_->settings().logFacility, tuned.facility))
         LOG_WARN("unknown log facility '", registry_->settings().logFacility, "', using daemon");
     tuned.socketPath = registry_->settings().logSocket;
     log::init(tuned);
+    LOG_INFO("logging re-initialised: level=", log::levelName(tuned.level), " facility=",
+             log::facilityName(tuned.facility), " socket=", tuned.socketPath);
 
+    LOG_DEBUG("creating replication engine");
     engine_ = std::make_unique<repl::Engine>(*registry_, *loader_);
 
     installSignals();
     auto servers = startServers();
     if (!servers) {
-        std::fprintf(stderr, "s3mmd: %s\n", servers.error().c_str());
+        LOG_CRITICAL("cannot start servers: ", servers.error());
         return 1;
     }
     writePidFile();
     running_ = true;
 
     if (options_.runOnce) {
-        LOG_INFO("running a single replication cycle");
+        LOG_NOTICE("running a single replication cycle");
+        log::Stopwatch sw;
         auto res = engine_->runOnce();
         if (!res) LOG_ERROR("cycle failed: ", res.error());
+        else LOG_NOTICE("single replication cycle completed in ", sw.ms(), " ms");
         stopServers();
         removePidFile();
         return res ? 0 : 1;
     }
 
     engine_->start();
-    LOG_NOTICE("s3mmd started (pid ", ::getpid(), ")");
+    LOG_NOTICE("s3mmd started (pid ", ::getpid(), ") in ", startup.ms(), " ms");
+    probeClustersAsync({}, "startup");
     mainLoop();
     LOG_NOTICE("s3mmd stopping");
+    log::Stopwatch stopping;
+    waitForProbes();
     engine_->stop();
     stopServers();
     removePidFile();
+    LOG_NOTICE("s3mmd stopped in ", stopping.ms(), " ms");
     return 0;
 }
 
@@ -417,17 +550,27 @@ int Daemon::run() {
 std::string Daemon::flushConfig() {
     std::string path = loadedConfigPath_.empty() ? options_.config : loadedConfigPath_;
     const auto& st = registry_->settings();
+    log::Stopwatch sw;
+    LOG_DEBUG("flushing runtime configuration to ", path);
 
     // Materialise every credential secret that is stored outside the secrets
     // directory: sealed with the master key when available, plain otherwise.
     for (const auto& c : registry_->credentials()) {
         if (c.secretIsPlain) continue;
         std::string sp = fs::joinPath(st.secretsDir, c.name);
-        if (fs::exists(sp)) continue;
+        if (fs::exists(sp)) {
+            LOG_DEBUG("secret file for credential '", c.name, "' already present: ", sp);
+            continue;
+        }
         fs::mkdirp(st.secretsDir);
         std::string body = st.masterKey.empty() ? c.secretKey : secret::seal(c.secretKey, st.masterKey);
-        if (!fs::writeFileAtomic(sp, body + "\n")) throw Error("cannot write secret file " + sp);
+        if (!fs::writeFileAtomic(sp, body + "\n")) {
+            LOG_ERROR("flush-config: cannot write secret file ", sp, " for credential '", c.name, "'");
+            throw Error("cannot write secret file " + sp);
+        }
         fs::setPermissions(sp, 0400);
+        LOG_INFO("secret for credential '", c.name, "' written to ", sp, " (",
+                 st.masterKey.empty() ? "plain" : "sealed", ", ", log::redact(c.secretKey), ")");
     }
     // A plain master key must be persisted too, otherwise sealed secrets can
     // never be reopened after a restart.
@@ -435,16 +578,25 @@ std::string Daemon::flushConfig() {
         std::string mk = fs::joinPath(st.secretsDir, "master_key");
         fs::mkdirp(st.secretsDir);
         if (!fs::exists(mk)) {
-            if (!fs::writeFileAtomic(mk, st.masterKey + "\n")) throw Error("cannot write master key file " + mk);
+            if (!fs::writeFileAtomic(mk, st.masterKey + "\n")) {
+                LOG_ERROR("flush-config: cannot write master key file ", mk);
+                throw Error("cannot write master key file " + mk);
+            }
             fs::setPermissions(mk, 0400);
+            LOG_INFO("master key persisted to ", mk, " (", log::redact(st.masterKey), ")");
         }
         registry_->mutableSettings().masterKeyFile = mk;
     }
 
     std::string text = registry_->dump();
     unsigned mode = fs::permissions(path).value_or(0640);
-    if (!fs::writeFileAtomic(path, text)) throw Error("cannot write " + path);
+    if (!fs::writeFileAtomic(path, text)) {
+        LOG_ERROR("flush-config: cannot write ", path);
+        throw Error("cannot write " + path);
+    }
     fs::setPermissions(path, mode);
+    LOG_INFO("runtime configuration written to ", path, " (", text.size(), " bytes, mode ", std::oct, mode, std::dec,
+             ") in ", sw.ms(), " ms");
     audit("flushed runtime configuration to " + path);
     return path;
 }
@@ -456,27 +608,50 @@ void Daemon::audit(const std::string& what) {
 // ----------------------------------------------------------------- reload ---
 
 Result<void> Daemon::reloadConfig() {
+    log::Stopwatch sw;
     bool wasRunning = engine_ && engine_->running();
+    LOG_INFO("reload: stopping engine (running=", wasRunning ? "yes" : "no", ")");
     if (engine_) engine_->stop();
     auto old = std::move(engine_); // stopped; kept only for its counters
 
+    LOG_DEBUG("reload: loading configuration ", options_.config);
     auto res = loadConfig();
     if (!res) {
+        LOG_ERROR("reload: configuration rejected: ", res.error(), "; restoring previous engine");
         engine_ = std::move(old);
         if (engine_ && wasRunning) engine_->start();
         return res;
     }
+    const auto& st = registry_->settings();
+    log::Options tuned;
+    tuned.ident = "s3mmd";
+    try {
+        tuned.level = log::levelFromString(st.logLevel);
+    } catch (const Error&) {
+        LOG_WARN("unknown log level '", st.logLevel, "', keeping info");
+        tuned.level = log::Level::Info;
+    }
+    if (!log::facilityFromString(st.logFacility, tuned.facility))
+        LOG_WARN("unknown log facility '", st.logFacility, "', using daemon");
+    tuned.socketPath = st.logSocket;
+    log::init(tuned);
+    LOG_INFO("reload: logging re-initialised: level=", log::levelName(tuned.level), " facility=",
+             log::facilityName(tuned.facility), " socket=", tuned.socketPath);
+    LOG_DEBUG("reload: creating new engine");
     engine_ = std::make_unique<repl::Engine>(*registry_, *loader_);
     if (old) engine_->stats().absorb(old->stats());
     old.reset();
     if (wasRunning) engine_->start();
+    LOG_NOTICE("reload: configuration ", options_.config, " applied in ", sw.ms(), " ms");
     audit("reloaded configuration from " + options_.config);
+    probeClustersAsync({}, "configuration reloaded");
     return Result<void>::success();
 }
 
 // ---------------------------------------------------------------- metrics ---
 
 std::string Daemon::metricsText() {
+    LOG_DEBUG("rendering metrics");
     std::vector<std::string> names;
     for (const auto& r : registry_->replications()) names.push_back(r.name);
 
@@ -506,7 +681,11 @@ std::string Daemon::metricsText() {
 
 Value Daemon::dispatch(const Value& req) {
     const std::string cmd = req.getString("cmd");
-    if (cmd.empty()) throw UsageError("missing 'cmd'");
+    if (cmd.empty()) {
+        LOG_WARN("control request without 'cmd'");
+        throw UsageError("missing 'cmd'");
+    }
+    LOG_DEBUG("dispatch: ", describeRequest(req));
 
     const Value& fields = fieldsOf(req);
     const bool permanent =
@@ -514,7 +693,9 @@ Value Daemon::dispatch(const Value& req) {
 
     /// stop -> mutate -> refreshState -> (re)start -> audit -> flush if permanent
     auto mutate = [&](const std::string& what, auto&& fn) {
+        log::Stopwatch sw;
         bool wasRunning = engine_ && engine_->running();
+        LOG_DEBUG("mutation '", what, "': stopping engine (running=", wasRunning ? "yes" : "no", ")");
         if (engine_) engine_->stop();
         std::string error;
         try {
@@ -526,20 +707,35 @@ Value Daemon::dispatch(const Value& req) {
         if (engine_) engine_->refreshState();
         if (engine_ && wasRunning) engine_->start();
         if (!error.empty()) {
+            LOG_ERROR("mutation '", what, "' failed: ", error);
             audit(what + " FAILED: " + error);
             throw Error(error);
         }
+        LOG_INFO("mutation '", what, "' applied in ", sw.ms(), " ms");
         audit(what);
         if (permanent) {
+            LOG_DEBUG("mutation '", what, "': permanent, flushing configuration");
             try {
                 flushConfig();
             } catch (const Error& e) {
+                LOG_ERROR("mutation '", what, "' applied but flush-config failed: ", e.what());
                 throw Error("applied but flush-config failed: " + std::string(e.what()));
             }
         }
     };
 
     // ---------------------------------------------------------------- basics --
+    if (cmd == "check") {
+        // Synchronous availability check of one cluster (name) or all of them.
+        std::string name = fstr(req, "name");
+        Value arr = Value::array();
+        for (const auto& c : registry_->clusters()) {
+            if (!name.empty() && c.name != name && c.alias != name) continue;
+            arr.push(repl::probeCluster(*registry_, c, loader_.get()).toValue());
+        }
+        if (!name.empty() && arr.items().empty()) throw UsageError("check: no cluster '" + name + "'");
+        return arr;
+    }
     if (cmd == "ping") {
         Value v = Value::object();
         v.set("version", Value::str(S3MM_VERSION));
@@ -576,6 +772,7 @@ Value Daemon::dispatch(const Value& req) {
         std::string path = fstr(req, "path", options_.config);
         std::vector<std::string> problems;
         auto cfg = config::Config::load(path);
+        LOG_DEBUG("validate: checking ", path);
         if (!cfg) {
             problems.push_back(cfg.error());
         } else {
@@ -584,6 +781,8 @@ Value Daemon::dispatch(const Value& req) {
             auto reg = registry::Registry::fromConfig(cfg.value());
             if (!reg) problems.push_back(reg.error());
         }
+        if (problems.empty()) LOG_INFO("validate: ", path, " is valid");
+        for (const auto& p : problems) LOG_WARN("validate: ", path, ": ", p);
         Value v = Value::object();
         v.set("path", Value::str(path));
         v.set("valid", Value::boolean(problems.empty()));
@@ -601,8 +800,12 @@ Value Daemon::dispatch(const Value& req) {
     }
 
     if (cmd == "reload") {
+        LOG_NOTICE("reload requested over the control socket");
         auto res = reloadConfig();
-        if (!res) throw Error("reload failed: " + res.error());
+        if (!res) {
+            LOG_ERROR("reload failed: ", res.error(), " — keeping the previous configuration");
+            throw Error("reload failed: " + res.error());
+        }
         Value v = Value::object();
         v.set("reloaded", Value::boolean(true));
         v.set("config", Value::str(options_.config));
@@ -642,13 +845,21 @@ Value Daemon::dispatch(const Value& req) {
         if (!engine_) throw Error("engine is not running");
         std::string rep = fstr(req, "replication");
         if (fbool(req, "async", false)) {
+            LOG_INFO("scan: asynchronous rescan of all replications queued");
             engine_->kick();
             Value v = Value::object();
             v.set("queued", Value::boolean(true));
             return v;
         }
+        LOG_INFO("scan: running synchronous cycle for ", rep.empty() ? "all replications" : "'" + rep + "'",
+                 fbool(req, "force", false) ? " (forced)" : "");
+        log::Stopwatch sw;
         auto res = engine_->runOnce(rep, fbool(req, "force", false));
-        if (!res) throw Error("scan failed: " + res.error());
+        if (!res) {
+            LOG_ERROR("scan of ", rep.empty() ? "all replications" : "'" + rep + "'", " failed: ", res.error());
+            throw Error("scan failed: " + res.error());
+        }
+        LOG_INFO("scan of ", rep.empty() ? "all replications" : "'" + rep + "'", " completed in ", sw.ms(), " ms");
         Value v = Value::object();
         v.set("replication", Value::str(rep.empty() ? "all" : rep));
         return v;
@@ -660,15 +871,22 @@ Value Daemon::dispatch(const Value& req) {
         int flushed = 0;
         if (!rep.empty()) {
             auto res = engine_->flush(rep);
-            if (!res) throw Error("flush failed: " + res.error());
+            if (!res) {
+                LOG_ERROR("flush of '", rep, "' failed: ", res.error());
+                throw Error("flush failed: " + res.error());
+            }
             flushed = 1;
         } else {
             for (const auto& r : registry_->replications()) {
                 auto res = engine_->flush(r.name);
-                if (!res) throw Error("flush of '" + r.name + "' failed: " + res.error());
+                if (!res) {
+                    LOG_ERROR("flush of '", r.name, "' failed: ", res.error());
+                    throw Error("flush of '" + r.name + "' failed: " + res.error());
+                }
                 ++flushed;
             }
         }
+        LOG_INFO("flushed ", flushed, " replication queue(s)");
         Value v = Value::object();
         v.set("flushed", Value::number((int64_t)flushed));
         return v;
@@ -720,8 +938,14 @@ Value Daemon::dispatch(const Value& req) {
         if (rep.empty()) throw UsageError("sync-accounts: replication name required");
         bool dryRun = fbool(req, "dry_run", true);
         bool prune = fbool(req, "prune", false);
+        LOG_INFO("sync-accounts '", rep, "' dry_run=", dryRun ? "yes" : "no", " prune=", prune ? "yes" : "no");
         auto res = engine_->syncAccounts(rep, dryRun, prune);
-        if (!res) throw Error("sync-accounts failed: " + res.error());
+        if (!res) {
+            LOG_ERROR("sync-accounts '", rep, "' failed: ", res.error());
+            throw Error("sync-accounts failed: " + res.error());
+        }
+        LOG_INFO("sync-accounts '", rep, "': matched=", res.value().matched, " created=", res.value().created,
+                 " updated=", res.value().updated, " deleted=", res.value().deleted, " failed=", res.value().failed);
         audit("sync-accounts replication '" + rep + "'" + (dryRun ? " (dry run)" : ""));
         return syncReportValue(res.value());
     }
@@ -801,6 +1025,7 @@ Value Daemon::dispatch(const Value& req) {
 
         // Validate against a scratch copy first: usage errors must not stop
         // the engine and must not leave partial side effects (secret files).
+        LOG_DEBUG(cmd, " ", kind, " '", name, "': validating on a scratch registry");
         {
             registry::Registry scratch = *registry_;
             registry::mutateEntity(scratch, cmd, kind, name, fields);
@@ -814,6 +1039,8 @@ Value Daemon::dispatch(const Value& req) {
                 if (registry_->settings().cacheDir != old.cacheDir) {
                     // The StateStore is bound to cache_dir: rebuild the engine
                     // while it is stopped; mutate() restarts it afterwards.
+                    LOG_INFO("cache_dir changed ", old.cacheDir, " -> ", registry_->settings().cacheDir,
+                             ", rebuilding engine");
                     auto oldEngine = std::move(engine_);
                     engine_ = std::make_unique<repl::Engine>(*registry_, *loader_);
                     if (oldEngine) engine_->stats().absorb(oldEngine->stats());
@@ -825,7 +1052,6 @@ Value Daemon::dispatch(const Value& req) {
                 st.logSocket != old.logSocket) {
                 log::Options tuned;
                 tuned.ident = "s3mmd";
-                tuned.toStderr = !options_.daemonize;
                 try {
                     tuned.level = log::levelFromString(st.logLevel);
                 } catch (const Error&) {
@@ -836,11 +1062,18 @@ Value Daemon::dispatch(const Value& req) {
                     LOG_WARN("unknown log facility '", st.logFacility, "', using daemon");
                 tuned.socketPath = st.logSocket;
                 log::init(tuned);
+                LOG_NOTICE("logging re-initialised: level=", log::levelName(tuned.level), " facility=",
+                           log::facilityName(tuned.facility), " socket=", tuned.socketPath);
             }
             if (st.socket != old.socket || st.metricsListen != old.metricsListen) {
+                LOG_NOTICE("server endpoints changed (socket ", old.socket, " -> ", st.socket, ", metrics ",
+                           old.metricsListen, " -> ", st.metricsListen, "), restarting servers");
                 stopServers();
                 auto res = startServers();
-                if (!res) throw Error("settings applied but servers failed: " + res.error());
+                if (!res) {
+                    LOG_ERROR("settings applied but servers failed: ", res.error());
+                    throw Error("settings applied but servers failed: " + res.error());
+                }
             }
             return out;
         }
@@ -849,6 +1082,7 @@ Value Daemon::dispatch(const Value& req) {
             out = registry::mutateEntity(*registry_, cmd, kind, name, fields);
             return Result<void>::success();
         });
+        if (kind == "cluster" && cmd != "rm") probeClustersAsync({name}, cmd + " cluster");
         return out;
     }
 
@@ -862,6 +1096,7 @@ Value Daemon::dispatch(const Value& req) {
         std::string after = fstr(req, "after");
         if (action == "list")
             return registry::applyRule(*registry_, action, bundleName, {}, {}, {}, {});
+        LOG_DEBUG("rule ", action, " on policy '", bundleName, "' ref='", ref, "': validating on a scratch registry");
         {
             registry::Registry scratch = *registry_;
             registry::applyRule(scratch, action, bundleName, ref, line, before, after);
@@ -877,6 +1112,7 @@ Value Daemon::dispatch(const Value& req) {
     // Clustering (peers, mTLS, inventory exchange) is not part of the core:
     // it lives in the optional s3mmc cluster client. Nothing to dispatch here.
 
+    LOG_WARN("unknown control command '", cmd, "'");
     throw UsageError("unknown command '" + cmd + "'");
 }
 

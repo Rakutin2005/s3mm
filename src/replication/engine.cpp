@@ -196,7 +196,10 @@ Engine::Engine(const registry::Registry& registry, module::Loader& loader)
       loader_(loader),
       state_(fs::joinPath(registry.settings().cacheDir, "state")),
       accounts_(registry, loader),
-      targets_(registry, &loader) {}
+      targets_(registry, &loader) {
+    LOG_DEBUG("replication engine created: state dir ", fs::joinPath(registry.settings().cacheDir, "state"),
+              ", ", registry.replications().size(), " replication(s) configured");
+}
 
 Engine::~Engine() { stop(); }
 
@@ -241,6 +244,8 @@ Engine::RepState* Engine::ensureState(const registry::Replication& rep) {
     }
     auto st = std::make_unique<RepState>();
     st->rep = &rep;
+    LOG_DEBUG("replication '", rep.name, "': state created (source=", rep.source, " destination=", rep.destination,
+              " policy=", policyName(rep), ")");
     auto* raw = st.get();
     reps_[rep.name] = std::move(st);
     return raw;
@@ -257,21 +262,35 @@ void Engine::persistDirty() {
         std::lock_guard<std::mutex> lock(dirtyMutex_);
         pending.swap(dirty_);
     }
+    if (pending.empty()) return;
+    log::Stopwatch sw;
+    size_t saved = 0, failed = 0;
     for (const auto& key : pending) {
         auto slash = key.find('/');
         auto slash2 = slash == std::string::npos ? std::string::npos : key.find('/', slash + 1);
-        if (slash2 == std::string::npos) continue;
+        if (slash2 == std::string::npos) {
+            LOG_WARN("delta cache save: malformed dirty key '", key, "' ignored");
+            continue;
+        }
         std::string rep = key.substr(0, slash);
         std::string source = key.substr(slash + 1, slash2 - slash - 1);
         std::string bucket = key.substr(slash2 + 1);
         // StateStore::bucket loads (and caches) the bucket state on demand
         auto res = state_.bucket(rep, source, bucket).save();
-        if (!res) LOG_WARN("delta cache save: ", res.error());
+        if (!res) {
+            failed++;
+            LOG_WARN("delta cache save for replication '", rep, "' source ", source, " bucket ", bucket, ": ",
+                     res.error());
+        } else {
+            saved++;
+            LOG_DEBUG("delta cache saved: replication '", rep, "' source ", source, " bucket ", bucket);
+        }
     }
     if (!pending.empty()) {
         auto res = state_.persist();
-        if (!res) LOG_WARN("state persist: ", res.error());
+        if (!res) LOG_WARN("state persist (", state_.root(), "): ", res.error());
     }
+    LOG_DEBUG("persisted ", saved, " dirty delta cache(s), ", failed, " failed, in ", sw.ms(), " ms");
 }
 
 void Engine::record(RouteInfo info) {
@@ -329,8 +348,13 @@ TargetGroupPtr Engine::resolveTarget(RepState& st, const Candidate& candidate) {
     if (same(st.routes.warning, candidate.target)) return st.routes.warning;
     if (auto created = targets_.create(candidate.target)) {
         auto group = created.value();
-        if (auto s3target = std::dynamic_pointer_cast<S3Target>(group)) s3target->bind(st.destination, st.source.get());
+        if (auto s3target = std::dynamic_pointer_cast<S3Target>(group)) s3target->bind(st.destination, st.source.get(), registry_.settings().cacheDir);
+        LOG_DEBUG("replication '", candidate.replication, "': resolved ad-hoc target '", candidate.target,
+                  "' (", group->kind(), ")");
         return group;
+    } else {
+        LOG_DEBUG("replication '", candidate.replication, "': target '", candidate.target,
+                  "' cannot be created: ", created.error());
     }
     // Unknown target: never silently ship into a basket the operator did not name.
     // denied/warning keep their explicit routes (quarantine must stay reachable);
@@ -347,6 +371,9 @@ Result<void> Engine::deliver(RepState& st, Candidate& candidate) {
     TargetGroupPtr target = resolveTarget(st, candidate);
     if (!target) {
         stat.failed++;
+        LOG_ERROR("replication '", candidate.replication, "': no target resolved for ", kindName(candidate.kind), " ",
+                  candidate.bucket, "/", candidate.key.empty() ? candidate.account : candidate.key, " (target '",
+                  candidate.target, "', outcome ", candidate.outcome, ")");
         return Result<void>::failure("no target resolved for " + candidate.bucket + "/" + candidate.key);
     }
 
@@ -370,6 +397,11 @@ Result<void> Engine::deliver(RepState& st, Candidate& candidate) {
     rec.contentType = candidate.contentType;
     rec.meta = candidate.meta;
 
+    LOG_DEBUG("replication '", candidate.replication, "': delivering ", rec.kind, " ", candidate.bucket, "/",
+              candidate.key.empty() ? candidate.account : candidate.key, " (", candidate.size, " bytes, outcome ",
+              candidate.outcome, ", rule ", candidate.rule, ", attempt ", candidate.attempts + 1, ") to ",
+              target->name());
+    log::Stopwatch sw;
     Result<void> res = target->ship(rec, "");
     if (res) {
         if (candidate.kind == Candidate::Kind::Object) {
@@ -393,25 +425,30 @@ Result<void> Engine::deliver(RepState& st, Candidate& candidate) {
                 stat.lastLagSec = lag;
                 stat.maxLagSec = std::max(stat.maxLagSec, lag);
             }
-            LOG_DEBUG("shipped ", candidate.bucket, "/", candidate.key, " (", candidate.size, " bytes) via ",
-                      target->name());
+            LOG_DEBUG("replication '", candidate.replication, "': shipped ", candidate.bucket, "/", candidate.key,
+                      " (", candidate.size, " bytes) via ", target->name(), " in ", sw.ms(), " ms");
         } else if (candidate.kind == Candidate::Kind::Delete) {
             stat.deleted++;
             if (const registry::Replication* rep = registry_.replication(candidate.replication)) {
                 state_.bucket(candidate.replication, rep->source, candidate.bucket).forget(candidate.key);
                 markDirty(candidate.replication, rep->source, candidate.bucket);
             }
-            LOG_INFO("propagated deletion of ", candidate.bucket, "/", candidate.key);
+            LOG_INFO("replication '", candidate.replication, "': propagated deletion of ", candidate.bucket, "/",
+                     candidate.key, " via ", target->name());
         } else {
             stat.shipped++;
+            LOG_DEBUG("replication '", candidate.replication, "': delivered ", rec.kind, " ",
+                      candidate.kind == Candidate::Kind::Account ? candidate.account : candidate.bucket, " to ",
+                      target->name(), " (outcome ", candidate.outcome, ") in ", sw.ms(), " ms");
         }
     } else {
         stat.failed++;
         stat.lastErrorText = res.error();
         stat.lastError = tm::now();
         candidate.attempts++;
-        LOG_WARN("delivery of ", kindName(candidate.kind), " ", candidate.bucket, "/",
-                 candidate.key.empty() ? candidate.account : candidate.key, " failed: ", res.error());
+        LOG_WARN("replication '", candidate.replication, "': delivery of ", kindName(candidate.kind), " ",
+                 candidate.bucket, "/", candidate.key.empty() ? candidate.account : candidate.key, " to ",
+                 target->name(), " failed (attempt ", candidate.attempts, ", ", sw.ms(), " ms): ", res.error());
     }
     return res;
 }
@@ -424,18 +461,35 @@ Result<void> Engine::propagateBucketSettings(RepState& st, const std::string& bu
     std::string tagText;
     for (const auto& [k, v] : tags.tags) tagText += k + "=" + v + "\n";
     std::string hash = crypto::sha256Hex(versioning + "\n" + tagText + "\n" + location + "\n" + policyJson);
-    if (state_.bucketSettingsHash(rep.name, bucket) == hash) return Result<void>::success(); // no delta
+    if (!tagging) LOG_DEBUG("replication '", rep.name, "': bucket ", bucket, " tagging unavailable: ", tagging.error());
+    if (state_.bucketSettingsHash(rep.name, bucket) == hash) { // no delta
+        LOG_DEBUG("replication '", rep.name, "': bucket ", bucket, " settings unchanged, nothing to propagate");
+        return Result<void>::success();
+    }
+    LOG_DEBUG("replication '", rep.name, "': bucket ", bucket, " settings changed (versioning=",
+              versioning.empty() ? "-" : versioning, " location=", location.empty() ? "-" : location, " tags=",
+              tags.tags.size(), " policy=", policyJson.empty() ? "none" : "set", "), propagating to ", rep.destination);
 
     auto exists = st.destination->headBucket(bucket);
-    if (!exists) return Result<void>(exists.error());
+    if (!exists) {
+        LOG_ERROR("replication '", rep.name, "': HEAD bucket ", bucket, " on ", rep.destination, ": ", exists.error());
+        return Result<void>(exists.error());
+    }
     if (!exists.value()) {
+        LOG_DEBUG("replication '", rep.name, "': creating bucket ", bucket, " on ", rep.destination,
+                  location.empty() ? "" : " in ", location);
         auto created = st.destination->createBucket(bucket, location);
-        if (!created) return Result<void>(created.error());
+        if (!created) {
+            LOG_ERROR("replication '", rep.name, "': create bucket ", bucket, " on ", rep.destination, ": ",
+                      created.error());
+            return Result<void>(created.error());
+        }
+        LOG_INFO("replication '", rep.name, "': created bucket ", bucket, " on ", rep.destination);
     }
     bool ok = true;
     std::string firstError;
     auto remember = [&](const std::string& what, const std::string& err) {
-        LOG_WARN("propagate ", what, " to ", bucket, ": ", err);
+        LOG_WARN("replication '", rep.name, "': propagate ", what, " to ", rep.destination, "/", bucket, ": ", err);
         if (ok) firstError = what + ": " + err;
         ok = false;
     };
@@ -456,7 +510,7 @@ Result<void> Engine::propagateBucketSettings(RepState& st, const std::string& bu
     if (!ok) return Result<void>::failure(firstError);
     state_.setBucketSettingsHash(rep.name, bucket, hash);
     auto saved = state_.persist();
-    if (!saved) LOG_WARN("persist bucket settings hash: ", saved.error());
+    if (!saved) LOG_WARN("replication '", rep.name, "': persist bucket settings hash of ", bucket, ": ", saved.error());
     LOG_INFO("replication '", rep.name, "': propagated settings of bucket ", bucket, " to ", rep.destination);
     return Result<void>::success();
 }
@@ -465,6 +519,9 @@ Result<void> Engine::scanBucket(RepState& st, const s3::BucketInfo& bucket) {
     const auto& rep = *st.rep;
     auto& stat = stats_.forReplication(rep.name);
     BucketCache& cache = state_.bucket(rep.name, rep.source, bucket.name);
+    log::Stopwatch sw;
+    LOG_DEBUG("replication '", rep.name, "': scanning bucket ", rep.source, "/", bucket.name, " (", cache.size(),
+              " cached entries)");
 
     // ---- bucket metadata
     std::string location = st.source->getBucketLocation(bucket.name).valueOr("");
@@ -507,7 +564,13 @@ Result<void> Engine::scanBucket(RepState& st, const s3::BucketInfo& bucket) {
                 const xml::Element* rule = doc.value().child("Rule");
                 const xml::Element* def = rule ? rule->child("ApplyServerSideEncryptionByDefault") : nullptr;
                 if (def) encryption = def->childText("SSEAlgorithm");
+            } else {
+                LOG_WARN("replication '", rep.name, "': bucket ", bucket.name, " encryption response unparsable: ",
+                         doc.error(), "; body ", log::clip(resp.body));
             }
+        } else {
+            LOG_DEBUG("replication '", rep.name, "': bucket ", bucket.name, " GET ?encryption -> HTTP ", resp.status,
+                      " (treated as none)");
         }
     }
     std::map<std::string, std::string> tags;
@@ -524,7 +587,10 @@ Result<void> Engine::scanBucket(RepState& st, const s3::BucketInfo& bucket) {
         std::string token;
         do {
             auto page = st.source->listObjects(bucket.name, {}, {}, token, 1000);
-            if (!page) return Result<void>::failure(page.error());
+            if (!page) {
+                LOG_ERROR("replication '", rep.name, "': list objects of ", bucket.name, " (counting): ", page.error());
+                return Result<void>::failure(page.error());
+            }
             for (const auto& o : page.value().objects) {
                 totalCount++;
                 totalSize += o.size;
@@ -536,7 +602,13 @@ Result<void> Engine::scanBucket(RepState& st, const s3::BucketInfo& bucket) {
     if (needCounts) {
         auto res = listCounts();
         if (!res) return res;
+        LOG_DEBUG("replication '", rep.name, "': bucket ", bucket.name, " holds ", totalCount, " object(s), ",
+                  totalSize, " bytes");
     }
+    LOG_DEBUG("replication '", rep.name, "': bucket ", bucket.name, " metadata: location=",
+              location.empty() ? "-" : location, " versioning=", versioning.empty() ? "-" : versioning, " type=", type,
+              " owner=", owner.empty() ? "-" : owner, " encryption=", encryption.empty() ? "none" : encryption,
+              " tags=", tags.size(), " policy-hash=", policyHash);
 
     policy::Context bctx = bucketContext(bucket.name, rep.source, zone, srcVendor, location, versioning, type, owner,
                                          encryption, policyHash, bucket.created, totalCount, totalSize);
@@ -564,8 +636,11 @@ Result<void> Engine::scanBucket(RepState& st, const s3::BucketInfo& bucket) {
     if (bdec.outcome == "success") stat.accepted++;
     else if (bdec.outcome == "denied") stat.denied++;
     else stat.warned++;
+    LOG_DEBUG("replication '", rep.name, "': bucket ", bucket.name, " decision: ", bdec.toString());
 
     if (bdec.outcome != "success") {
+        LOG_INFO("replication '", rep.name, "': bucket ", bucket.name, " not replicated (outcome ", bdec.outcome,
+                 ", target ", bdec.target, ")");
         // the bucket does not replicate at all: no object listing, no delta
         Candidate c;
         c.kind = Candidate::Kind::Bucket;
@@ -597,25 +672,42 @@ Result<void> Engine::scanBucket(RepState& st, const s3::BucketInfo& bucket) {
                           mentionsRule(st.bundle, policy::Category::Object, "chunk-count");
     const bool needTags = mentionsRule(st.bundle, policy::Category::Object, "tags.");
     const tm::TimePoint scanNow = tm::now();
+    uint64_t listed = 0, unchanged = 0, alreadyQueued = 0, metaOnly = 0, changedCount = 0, queued = 0, routed = 0,
+             routeFailed = 0, pages = 0;
     std::string token;
     do {
         auto page = st.source->listObjects(bucket.name, {}, {}, token, 1000);
-        if (!page) return Result<void>::failure(page.error());
+        if (!page) {
+            LOG_ERROR("replication '", rep.name, "': list objects of ", bucket.name, " (page ", pages + 1,
+                      "): ", page.error());
+            return Result<void>::failure(page.error());
+        }
+        pages++;
+        LOG_DEBUG("replication '", rep.name, "': bucket ", bucket.name, " page ", pages, ": ",
+                  page.value().objects.size(), " object(s)", page.value().truncated ? " (truncated)" : "");
         for (const auto& o : page.value().objects) {
             const std::string& key = o.key;
             seen.insert(key);
             stat.objectsScanned++;
+            listed++;
 
             bool contentChanged = cache.changed(o);
             std::string qk = bucket.name + "\x1f" + key;
             {
                 std::lock_guard<std::mutex> lock(st.queueMutex);
-                if (st.queuedKeys.count(qk)) continue; // already waiting for shipment
+                if (st.queuedKeys.count(qk)) { // already waiting for shipment
+                    alreadyQueued++;
+                    LOG_DEBUG("replication '", rep.name, "': skip ", bucket.name, "/", key, ": already queued");
+                    continue;
+                }
             }
             bool due = contentChanged ||
                        (rep.metadataEverySec > 0 && cache.metadataDue(key, scanNow, rep.metadataEverySec));
             bool checkMeta = due || needHead || needTags;
-            if (!checkMeta) continue;
+            if (!checkMeta) {
+                unchanged++;
+                continue;
+            }
 
             s3::ObjectMeta meta;
             auto head = st.source->headObject(bucket.name, key);
@@ -624,13 +716,20 @@ Result<void> Engine::scanBucket(RepState& st, const s3::BucketInfo& bucket) {
                                       ": ", head.error());
             auto tagging = st.source->getObjectTagging(bucket.name, key);
             if (tagging) meta.tags = tagging.value().tags;
+            else LOG_DEBUG("replication '", rep.name, "': cannot read tags of ", bucket.name, "/", key, ": ",
+                           tagging.error());
 
             std::string metaHash = metadataFingerprint(meta);
             std::string tagHash = tagsFingerprint(meta.tags);
             if (!contentChanged && !cache.metadataChanged(key, metaHash, tagHash)) {
                 cache.noteMetadata(key, metaHash, tagHash, scanNow);
+                unchanged++;
                 continue;
             }
+            if (contentChanged) changedCount++;
+            else metaOnly++;
+            LOG_DEBUG("replication '", rep.name, "': delta ", bucket.name, "/", key, " (",
+                      contentChanged ? "content" : "metadata/tags", " changed, ", o.size, " bytes, etag ", o.etag, ")");
 
             stat.deltaDetected++;
             stat.bytesDetected += o.size;
@@ -664,16 +763,24 @@ Result<void> Engine::scanBucket(RepState& st, const s3::BucketInfo& bucket) {
                 std::lock_guard<std::mutex> lock(st.queueMutex);
                 if (st.queuedKeys.insert(qk).second) {
                     if (st.queue.empty()) st.queueSinceSec = nowSec();
+                    LOG_DEBUG("replication '", rep.name, "': queued ", bucket.name, "/", key, " (", o.size,
+                              " bytes, rule ", c.rule, ", target ", c.target, "), queue depth ", st.queue.size() + 1);
                     st.queue.push_back(QueuedItem{std::move(c), nowSec()});
+                    queued++;
                 }
             } else {
                 if (d.outcome == "denied") stat.denied++;
                 else stat.warned++;
+                LOG_DEBUG("replication '", rep.name, "': ", bucket.name, "/", key, " routed to ", d.outcome,
+                          " target ", d.target, " (rule ", c.rule, ")");
                 auto res = deliver(st, c);
                 if (res) {
                     // settled: do not re-evaluate until the source changes
                     cache.observe(o);
                     cache.noteMetadata(key, metaHash, tagHash, scanNow);
+                    routed++;
+                } else {
+                    routeFailed++;
                 }
             }
         }
@@ -684,6 +791,9 @@ Result<void> Engine::scanBucket(RepState& st, const s3::BucketInfo& bucket) {
     std::vector<std::string> gone;
     for (const auto& [key, entry] : cache.entries())
         if (!entry.deleted && !seen.count(key)) gone.push_back(key);
+    if (!gone.empty())
+        LOG_DEBUG("replication '", rep.name, "': bucket ", bucket.name, ": ", gone.size(),
+                  " object(s) disappeared from the source");
     for (const auto& key : gone) {
         cache.markDeleted(key, tm::now());
         stat.deltaDetected++;
@@ -692,14 +802,23 @@ Result<void> Engine::scanBucket(RepState& st, const s3::BucketInfo& bucket) {
     std::vector<std::string> tombstones;
     for (const auto& [key, entry] : cache.entries())
         if (entry.deleted) tombstones.push_back(key);
+    uint64_t tombForgotten = 0, tombWaiting = 0, tombQueued = 0, tombRouted = 0;
     for (const auto& key : tombstones) {
         if (!rep.deletePropagation) {
             cache.forget(key); // propagation disabled: just forget
+            tombForgotten++;
+            LOG_DEBUG("replication '", rep.name, "': forget tombstone ", bucket.name, "/", key,
+                      " (delete propagation disabled)");
             continue;
         }
         const CacheEntry& entry = cache.entries().at(key);
         int64_t age = elapsed((int64_t)tm::toSeconds(entry.deletedAt));
-        if (rep.retentionSec > 0 && age < rep.retentionSec) continue; // wait out the retention window
+        if (rep.retentionSec > 0 && age < rep.retentionSec) { // wait out the retention window
+            tombWaiting++;
+            LOG_DEBUG("replication '", rep.name, "': tombstone ", bucket.name, "/", key, " in retention (", age, "/",
+                      rep.retentionSec, " s)");
+            continue;
+        }
 
         s3::ObjectInfo info;
         info.key = key;
@@ -738,19 +857,31 @@ Result<void> Engine::scanBucket(RepState& st, const s3::BucketInfo& bucket) {
         else if (d.outcome == "denied") stat.denied++;
         else stat.warned++;
 
+        LOG_DEBUG("replication '", rep.name, "': deletion of ", bucket.name, "/", key, " decision: ", c.reason);
         if (d.outcome == "success") {
             std::string qk = bucket.name + "\x1f" + key;
             std::lock_guard<std::mutex> lock(st.queueMutex);
             if (st.queuedKeys.insert(qk).second) {
                 if (st.queue.empty()) st.queueSinceSec = nowSec();
                 st.queue.push_back(QueuedItem{std::move(c), nowSec()});
+                tombQueued++;
+                LOG_DEBUG("replication '", rep.name, "': queued deletion of ", bucket.name, "/", key);
             }
         } else {
             auto res = deliver(st, c);
-            if (res) cache.forget(key); // settled elsewhere: drop the tombstone
+            if (res) { // settled elsewhere: drop the tombstone
+                cache.forget(key);
+                tombRouted++;
+            }
         }
     }
 
+    LOG_INFO("replication '", rep.name, "': bucket ", bucket.name, " scanned in ", sw.ms(), " ms: listed=", listed,
+             " pages=", pages, " unchanged=", unchanged, " changed=", changedCount, " metadata-changed=", metaOnly,
+             " already-queued=", alreadyQueued, " queued=", queued, " routed-elsewhere=", routed,
+             " route-failed=", routeFailed, " gone=", gone.size(), " deletions-queued=", tombQueued,
+             " deletions-routed=", tombRouted, " deletions-waiting=", tombWaiting, " tombstones-forgotten=",
+             tombForgotten);
     return Result<void>::success();
 }
 
@@ -774,7 +905,14 @@ Result<void> Engine::shipReady(RepState& st, bool force) {
         // Tombstones have size 0 and are already past the retention window when
         // they enter the queue. Size/min-size thresholds would otherwise keep
         // them pending forever (notably with --run-once).
-        if (!force && !hasDeletes && !thresholdsReached(th, bytes, qualifying, age)) return Result<void>::success();
+        if (!force && !hasDeletes && !thresholdsReached(th, bytes, qualifying, age)) {
+            LOG_DEBUG("replication '", rep.name, "': holding ", st.queue.size(), " item(s), ", bytes, " bytes (",
+                      qualifying, " qualifying), age ", age, " s: thresholds not reached (size ", th.sizeBytes,
+                      ", period ", th.periodSec, " s, min ", th.minSizeBytes, ", max-disk ", th.maxDiskBytes, ")");
+            return Result<void>::success();
+        }
+        LOG_DEBUG("replication '", rep.name, "': flushing queue of ", st.queue.size(), " item(s), ", bytes,
+                  " bytes, age ", age, " s: ", force ? "forced" : hasDeletes ? "deletions pending" : "thresholds reached");
         items = std::move(st.queue);
         st.queue.clear();
         st.queuedKeys.clear();
@@ -785,12 +923,23 @@ Result<void> Engine::shipReady(RepState& st, bool force) {
     tm::TimePoint shipStarted = tm::now();
 
     std::vector<QueuedItem> retry;
+    size_t delivered = 0, gaveUp = 0;
+    uint64_t deliveredBytes = 0;
     for (auto& item : items) {
         auto res = deliver(st, item.candidate);
-        if (!res && item.candidate.attempts < registry_.settings().retries) retry.push_back(std::move(item));
-        else if (!res)
+        if (res) {
+            delivered++;
+            deliveredBytes += item.candidate.size;
+        } else if (item.candidate.attempts < registry_.settings().retries) {
+            LOG_WARN("replication '", rep.name, "': will retry ", item.candidate.bucket, "/", item.candidate.key,
+                     " on the next shipment (attempt ", item.candidate.attempts, "/", registry_.settings().retries,
+                     ")");
+            retry.push_back(std::move(item));
+        } else {
+            gaveUp++;
             LOG_ERROR("replication '", rep.name, "': giving up on ", item.candidate.bucket, "/",
                       item.candidate.key, " after ", item.candidate.attempts, " attempts: ", res.error());
+        }
     }
     if (!retry.empty()) {
         std::lock_guard<std::mutex> lock(st.queueMutex);
@@ -804,6 +953,13 @@ Result<void> Engine::shipReady(RepState& st, bool force) {
     }
     stat.lastShipMs = std::chrono::duration_cast<std::chrono::milliseconds>(tm::now() - shipStarted).count();
     stat.lastShip = tm::now();
+    if (gaveUp > 0 || !retry.empty())
+        LOG_WARN("replication '", rep.name, "': shipment of ", items.size(), " item(s) in ", stat.lastShipMs,
+                 " ms: delivered=", delivered, " (", deliveredBytes, " bytes) retry=", retry.size(), " failed=",
+                 gaveUp);
+    else
+        LOG_INFO("replication '", rep.name, "': shipped ", delivered, " item(s), ", deliveredBytes, " bytes in ",
+                 stat.lastShipMs, " ms");
     persistDirty();
     return Result<void>::success();
 }
@@ -815,25 +971,47 @@ Result<void> Engine::scanReplication(RepState& st) {
     {
         std::lock_guard<std::mutex> lock(st.initMutex);
         if (!st.initialized) {
+            LOG_DEBUG("replication '", rep.name, "': initialising clients, policy and routes");
             const registry::Cluster* srcCluster = registry_.cluster(rep.source);
             const registry::Cluster* dstCluster = registry_.cluster(rep.destination);
-            if (!srcCluster) return Result<void>::failure("unknown source cluster '" + rep.source + "'");
-            if (!dstCluster) return Result<void>::failure("unknown destination cluster '" + rep.destination + "'");
+            if (!srcCluster) {
+                LOG_ERROR("replication '", rep.name, "': unknown source cluster '", rep.source, "'");
+                return Result<void>::failure("unknown source cluster '" + rep.source + "'");
+            }
+            if (!dstCluster) {
+                LOG_ERROR("replication '", rep.name, "': unknown destination cluster '", rep.destination, "'");
+                return Result<void>::failure("unknown destination cluster '" + rep.destination + "'");
+            }
             auto src = accounts_.clientFor(*srcCluster);
-            if (!src) return Result<void>(src.error());
+            if (!src) {
+                LOG_ERROR("replication '", rep.name, "': source client for ", rep.source, ": ", src.error());
+                return Result<void>(src.error());
+            }
             auto dst = accounts_.clientFor(*dstCluster);
-            if (!dst) return Result<void>(dst.error());
+            if (!dst) {
+                LOG_ERROR("replication '", rep.name, "': destination client for ", rep.destination, ": ", dst.error());
+                return Result<void>(dst.error());
+            }
             st.source = src.value();
             st.destination = dst.value();
             st.bundle = registry_.bundleOrBuiltin(rep.policy);
+            LOG_DEBUG("replication '", rep.name, "': policy bundle '", st.bundle.name, "' (", st.bundle.rules.size(),
+                      " rule(s))");
             auto routes = targets_.routesFor(rep);
-            if (!routes) return Result<void>(routes.error());
+            if (!routes) {
+                LOG_ERROR("replication '", rep.name, "': resolve target routes: ", routes.error());
+                return Result<void>(routes.error());
+            }
             st.routes = routes.value();
             for (TargetGroupPtr* group : {&st.routes.success, &st.routes.denied, &st.routes.warning}) {
                 if (auto s3target = std::dynamic_pointer_cast<S3Target>(*group))
-                    s3target->bind(st.destination, st.source.get());
+                    s3target->bind(st.destination, st.source.get(), registry_.settings().cacheDir);
             }
             st.initialized = true;
+            LOG_INFO("replication '", rep.name, "': initialised ", rep.source, " -> ", rep.destination, ", policy '",
+                     policyName(rep), "', routes success=", st.routes.success ? st.routes.success->name() : "-",
+                     " denied=", st.routes.denied ? st.routes.denied->name() : "-",
+                     " warning=", st.routes.warning ? st.routes.warning->name() : "-");
         }
     }
 
@@ -850,6 +1028,7 @@ Result<void> Engine::scanReplication(RepState& st) {
         ri.target = d.target;
         ri.rule = d.rule ? (d.rule->name.empty() ? std::to_string(d.rule->order) : d.rule->name) : std::string("default");
         ri.reason = d.toString();
+        LOG_DEBUG("replication '", rep.name, "': account ", account.accessKey, " access decision: ", d.toString());
         record(std::move(ri));
         if (d.outcome == "success") {
             stat.accepted++;
@@ -878,27 +1057,41 @@ Result<void> Engine::scanReplication(RepState& st) {
             LOG_INFO("replication '", rep.name, "': account sync created=", sync.value().created,
                      " updated=", sync.value().updated, " deleted=", sync.value().deleted,
                      " matched=", sync.value().matched);
+        else
+            LOG_DEBUG("replication '", rep.name, "': account sync: no changes (matched=", sync.value().matched, ")");
     } else {
         LOG_DEBUG("replication '", rep.name, "': account sync skipped: ", sync.error());
     }
 
     // ---- buckets
+    log::Stopwatch listSw;
     auto buckets = st.source->listBuckets();
     if (!buckets) {
+        LOG_ERROR("replication '", rep.name, "': list buckets on ", rep.source, ": ", buckets.error());
         stat.lastError = tm::now();
         stat.lastErrorText = buckets.error();
         return Result<void>(buckets.error());
     }
+    LOG_DEBUG("replication '", rep.name, "': ", buckets.value().size(), " bucket(s) on ", rep.source, " listed in ",
+              listSw.ms(), " ms");
+    size_t bucketsMatched = 0, bucketsFailed = 0;
     for (const auto& bucket : buckets.value()) {
-        if (!glob::matchFilter(rep.buckets, bucket.name)) continue;
+        if (!glob::matchFilter(rep.buckets, bucket.name)) {
+            LOG_DEBUG("replication '", rep.name, "': bucket ", bucket.name, " skipped by bucket filter");
+            continue;
+        }
+        bucketsMatched++;
         stat.bucketsScanned++;
         auto res = scanBucket(st, bucket);
         if (!res) {
+            bucketsFailed++;
             LOG_WARN("replication '", rep.name, "': bucket ", bucket.name, ": ", res.error());
             stat.lastError = tm::now();
             stat.lastErrorText = res.error();
         }
     }
+    LOG_DEBUG("replication '", rep.name, "': ", bucketsMatched, " bucket(s) matched the filter, ", bucketsFailed,
+              " failed");
 
     // ---- bucket deletions observed on the source
     if (rep.deletePropagation) {
@@ -919,16 +1112,23 @@ Result<void> Engine::scanReplication(RepState& st) {
             if (state_.bucketDeleteSince(rep.name, rep.source, name) == tm::TimePoint{}) {
                 state_.markBucketMissing(rep.name, rep.source, name, tm::now());
                 stateChanged = true;
+                LOG_INFO("replication '", rep.name, "': bucket ", name, " disappeared from ", rep.source);
             }
             auto since = state_.bucketDeleteSince(rep.name, rep.source, name);
             int64_t age = elapsed((int64_t)tm::toSeconds(since));
-            if (rep.retentionSec > 0 && age < rep.retentionSec) continue;
+            if (rep.retentionSec > 0 && age < rep.retentionSec) {
+                LOG_DEBUG("replication '", rep.name, "': bucket ", name, " deletion in retention (", age, "/",
+                          rep.retentionSec, " s)");
+                continue;
+            }
+            LOG_DEBUG("replication '", rep.name, "': propagating deletion of bucket ", name, " to ", rep.destination);
             auto exists = st.destination->headBucket(name);
             if (!exists) {
                 LOG_WARN("replication '", rep.name, "': bucket ", name, " deletion: ", exists.error());
                 continue;
             }
             if (!exists.value()) {
+                LOG_DEBUG("replication '", rep.name, "': bucket ", name, " already absent on ", rep.destination);
                 state_.forgetBucket(rep.name, rep.source, name);
                 stateChanged = true;
                 continue;
@@ -960,7 +1160,11 @@ Result<void> Engine::scanReplication(RepState& st) {
                     }
                     return Result<void>::success();
                 });
-                if (!objects) ok = false;
+                if (!objects) {
+                    ok = false;
+                    LOG_WARN("replication '", rep.name, "': emptying deleted bucket ", name, " failed: ",
+                             objects.error(), "; will retry on the next scan");
+                }
             }
             if (!ok) continue;
             auto del = st.destination->deleteBucket(name);
@@ -979,6 +1183,10 @@ Result<void> Engine::scanReplication(RepState& st) {
     }
     stat.scanCycles++;
     stat.lastScan = tm::now();
+    LOG_DEBUG("replication '", rep.name, "': stats scans=", stat.scanCycles, " buckets=", stat.bucketsScanned,
+              " objects=", stat.objectsScanned, " delta=", stat.deltaDetected, " accepted=", stat.accepted, " denied=",
+              stat.denied, " warned=", stat.warned, " shipped=", stat.shipped, " failed=", stat.failed, " deleted=",
+              stat.deleted, " bytes-shipped=", stat.bytesShipped);
     return Result<void>::success();
 }
 
@@ -997,14 +1205,23 @@ void Engine::processScan(const std::string& name) {
     auto& stat = stats_.forReplication(name);
     stat.inFlight = true;
     st->inScan.store(true);
-    int64_t t0 = nowSec();
+    int64_t t0 = tm::nowMs();
+    log::Stopwatch sw;
+    LOG_INFO("replication '", name, "': scan cycle ", stat.scanCycles + 1, " started");
     auto res = scanReplication(*st);
     if (!res) {
-        LOG_ERROR("replication '", name, "': scan failed: ", res.error());
+        LOG_ERROR("replication '", name, "': scan failed after ", sw.ms(), " ms: ", res.error());
         stat.lastError = tm::now();
         stat.lastErrorText = res.error();
+    } else {
+        size_t depth;
+        {
+            std::lock_guard<std::mutex> lock(st->queueMutex);
+            depth = st->queue.size();
+        }
+        LOG_INFO("replication '", name, "': scan cycle finished in ", sw.ms(), " ms, queue depth ", depth);
     }
-    stat.lastScanMs = (nowSec() - t0) * 1000;
+    stat.lastScanMs = tm::nowMs() - t0;
     stat.inFlight = false;
     st->inScan.store(false);
     st->lastScanSec = nowSec();
@@ -1016,10 +1233,14 @@ void Engine::processShip(const std::string& name, bool force) {
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         auto it = reps_.find(name);
-        if (it == reps_.end()) return;
+        if (it == reps_.end()) {
+            LOG_WARN("ship request for unknown replication '", name, "' ignored");
+            return;
+        }
         st = it->second.get();
     }
     std::lock_guard<std::mutex> op(st->opMutex);
+    LOG_DEBUG("replication '", name, "': processing shipment", force ? " (forced)" : "");
     st->shipQueued.store(false); // allow the scheduler to queue the next shipment
     auto res = shipReady(*st, force);
     if (!res) LOG_ERROR("replication '", name, "': shipment failed: ", res.error());
@@ -1030,14 +1251,21 @@ void Engine::queueWork(const std::string& replication, bool scan, bool force) {
     std::lock_guard<std::mutex> lock(workMutex_);
     if (poolMode_) {
         sharedQueue_.push_back(item);
+        LOG_DEBUG("queued ", scan ? "scan" : "shipment", " of replication '", replication,
+                  "' to the shared pool (depth ", sharedQueue_.size(), ")");
     } else {
         const registry::Replication* rep = registry_.replication(replication);
-        policyQueues_[rep ? policyName(*rep) : std::string("default")].push_back(item);
+        std::string policy = rep ? policyName(*rep) : std::string("default");
+        auto& queue = policyQueues_[policy];
+        queue.push_back(item);
+        LOG_DEBUG("queued ", scan ? "scan" : "shipment", " of replication '", replication, "' to policy worker '",
+                  policy, "' (depth ", queue.size(), ")");
     }
     workCv_.notify_all();
 }
 
 void Engine::schedulerLoop() {
+    LOG_DEBUG("replication scheduler thread started");
     while (!stop_) {
         for (int i = 0; i < 10 && !stop_; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
         if (stop_) break;
@@ -1052,7 +1280,11 @@ void Engine::schedulerLoop() {
             if (scanEvery <= 0) scanEvery = 300;
             if (elapsed(st->lastScanSec) >= scanEvery) {
                 bool expected = false;
-                if (st->scanQueued.compare_exchange_strong(expected, true)) queueWork(rep.name, true, false);
+                if (st->scanQueued.compare_exchange_strong(expected, true)) {
+                    LOG_DEBUG("scheduler: replication '", rep.name, "' scan due (every ", scanEvery, " s, last ",
+                              isoFromSec(st->lastScanSec), ")");
+                    queueWork(rep.name, true, false);
+                }
                 continue;
             }
             // time/size trigger between scans
@@ -1071,13 +1303,19 @@ void Engine::schedulerLoop() {
             }
             if (due) {
                 bool expected = false;
-                if (st->shipQueued.compare_exchange_strong(expected, true)) queueWork(rep.name, false, false);
+                if (st->shipQueued.compare_exchange_strong(expected, true)) {
+                    LOG_DEBUG("scheduler: replication '", rep.name, "' queue thresholds reached, shipment due");
+                    queueWork(rep.name, false, false);
+                }
             }
         }
     }
+    LOG_DEBUG("replication scheduler thread stopped");
 }
 
 void Engine::workerLoop(const std::string& policyFilter) {
+    LOG_DEBUG("replication worker started (", poolMode_ ? std::string("shared pool") : "policy '" + policyFilter + "'",
+              ")");
     std::unique_lock<std::mutex> lock(workMutex_);
     while (!stop_) {
         WorkItem item;
@@ -1102,17 +1340,30 @@ void Engine::workerLoop(const std::string& policyFilter) {
         }
         if (!have) continue;
         lock.unlock();
-        if (item.scan) {
-            processScan(item.replication);
-        } else {
-            processShip(item.replication, item.force);
+        LOG_DEBUG("worker ", poolMode_ ? std::string("[pool]") : "[" + policyFilter + "]", " picked ",
+                  item.scan ? "scan" : "shipment", " of replication '", item.replication, "'");
+        try {
+            if (item.scan) {
+                processScan(item.replication);
+            } else {
+                processShip(item.replication, item.force);
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR("worker: ", item.scan ? "scan" : "shipment", " of replication '", item.replication,
+                      "' threw: ", e.what());
+            throw;
         }
         lock.lock();
     }
+    LOG_DEBUG("replication worker stopped (", poolMode_ ? std::string("shared pool") : "policy '" + policyFilter + "'",
+              ")");
 }
 
 Result<void> Engine::start() {
-    if (scheduler_.joinable()) return Result<void>::success();
+    if (scheduler_.joinable()) {
+        LOG_DEBUG("replication engine already running");
+        return Result<void>::success();
+    }
     stop_ = false;
     poolMode_ = registry_.settings().workerCount > 0;
     if (poolMode_) {
@@ -1124,18 +1375,22 @@ Result<void> Engine::start() {
         if (policies.empty()) policies.insert("default");
         for (const auto& policy : policies) {
             std::lock_guard<std::mutex> lock(workMutex_);
+            LOG_DEBUG("starting dedicated worker for policy '", policy, "'");
             policyQueues_[policy];
             workers_.emplace_back([this, policy] { workerLoop(policy); });
         }
     }
     scheduler_ = std::thread([this] { schedulerLoop(); });
-    LOG_INFO("replication engine started: ", workers_.size(), " worker(s)",
-             poolMode_ ? " (shared pool)" : " (dedicated per policy)");
+    LOG_NOTICE("replication engine started: ", workers_.size(), " worker(s)",
+               poolMode_ ? " (shared pool)" : " (dedicated per policy)", ", ", registry_.replications().size(),
+               " replication(s), retries ", registry_.settings().retries);
     return Result<void>::success();
 }
 
 void Engine::stop() {
     if (!scheduler_.joinable() && workers_.empty()) return;
+    log::Stopwatch sw;
+    LOG_INFO("stopping replication engine (", workers_.size(), " worker(s))");
     stop_ = true;
     workCv_.notify_all();
     if (scheduler_.joinable()) scheduler_.join();
@@ -1143,11 +1398,12 @@ void Engine::stop() {
         if (worker.joinable()) worker.join();
     workers_.clear();
     persistDirty();
-    LOG_INFO("replication engine stopped");
+    LOG_NOTICE("replication engine stopped in ", sw.ms(), " ms");
 }
 
 Result<void> Engine::rebuild() {
     bool wasRunning = running();
+    LOG_INFO("rebuilding replication engine workers (was ", wasRunning ? "running" : "stopped", ")");
     stop();
     stop_ = false;
     if (wasRunning) return start();
@@ -1156,6 +1412,7 @@ Result<void> Engine::rebuild() {
 
 void Engine::kick() {
     std::lock_guard<std::mutex> lock(stateMutex_);
+    LOG_INFO("rescan requested for ", reps_.size(), " replication(s)");
     for (auto& [name, st] : reps_) st->lastScanSec = 0;
 }
 
@@ -1169,9 +1426,13 @@ Result<void> Engine::flush(const std::string& replication) {
     if (!st) {
         // unknown to the engine yet: create the state so a flush still works
         const registry::Replication* rep = registry_.replication(replication);
-        if (!rep) return Result<void>::failure("unknown replication '" + replication + "'");
+        if (!rep) {
+            LOG_ERROR("flush: unknown replication '", replication, "'");
+            return Result<void>::failure("unknown replication '" + replication + "'");
+        }
         st = ensureState(*rep);
     }
+    LOG_INFO("replication '", replication, "': forced flush requested");
     std::lock_guard<std::mutex> op(st->opMutex);
     auto res = shipReady(*st, true);
     if (!res) LOG_ERROR("replication '", replication, "': forced shipment failed: ", res.error());
@@ -1179,18 +1440,29 @@ Result<void> Engine::flush(const std::string& replication) {
 }
 
 Result<void> Engine::runOnce(const std::string& onlyReplication, bool forceShip) {
+    log::Stopwatch total;
+    LOG_INFO("single pass started", onlyReplication.empty() ? std::string() : " for replication '" + onlyReplication + "'",
+             forceShip ? " (forced shipment)" : "");
+    size_t ran = 0;
     for (const auto& rep : registry_.replications()) {
         if (!onlyReplication.empty() && rep.name != onlyReplication) continue;
-        if (rep.paused) continue;
+        if (rep.paused) {
+            LOG_INFO("replication '", rep.name, "' is paused, skipped");
+            continue;
+        }
         RepState* st = ensureState(rep);
         if (!st) continue;
+        ran++;
         std::lock_guard<std::mutex> op(st->opMutex);
         auto& stat = stats_.forReplication(rep.name);
         stat.inFlight = true;
+        log::Stopwatch sw;
+        LOG_INFO("replication '", rep.name, "': scan started");
         auto res = scanReplication(*st);
         stat.inFlight = false;
+        if (res) LOG_INFO("replication '", rep.name, "': scan finished in ", sw.ms(), " ms");
         if (!res) {
-            LOG_ERROR("replication '", rep.name, "': scan failed: ", res.error());
+            LOG_ERROR("replication '", rep.name, "': scan failed after ", sw.ms(), " ms: ", res.error());
             stat.lastError = tm::now();
             stat.lastErrorText = res.error();
         }
@@ -1198,7 +1470,10 @@ Result<void> Engine::runOnce(const std::string& onlyReplication, bool forceShip)
         auto shipped = shipReady(*st, forceShip);
         if (!shipped) LOG_ERROR("replication '", rep.name, "': shipment failed: ", shipped.error());
     }
+    if (ran == 0 && !onlyReplication.empty())
+        LOG_WARN("single pass: replication '", onlyReplication, "' not found or paused");
     persistDirty();
+    LOG_INFO("single pass finished: ", ran, " replication(s) in ", total.ms(), " ms");
     return Result<void>::success();
 }
 
@@ -1207,9 +1482,11 @@ void Engine::refreshState() {
     for (auto it = reps_.begin(); it != reps_.end();) {
         const registry::Replication* rep = registry_.replication(it->first);
         if (!rep) { // removed by the CLI mutation: drop the whole state
+            LOG_INFO("replication '", it->first, "' removed: dropping its engine state");
             it = reps_.erase(it);
             continue;
         }
+        LOG_DEBUG("replication '", it->first, "': state invalidated, will re-initialise on next scan");
         it->second->rep = rep;
         // force re-resolution of clients/bundle/routes on the next scan
         std::lock_guard<std::mutex> init(it->second->initMutex);
@@ -1220,7 +1497,12 @@ void Engine::refreshState() {
 
 Result<SyncReport> Engine::syncAccounts(const std::string& replication, bool dryRun, bool prune) {
     const registry::Replication* rep = registry_.replication(replication);
-    if (!rep) return Result<SyncReport>::failure("unknown replication '" + replication + "'");
+    if (!rep) {
+        LOG_ERROR("sync accounts: unknown replication '", replication, "'");
+        return Result<SyncReport>::failure("unknown replication '" + replication + "'");
+    }
+    LOG_INFO("replication '", replication, "': account sync requested", dryRun ? " (dry run)" : "",
+             prune ? " (prune)" : "");
     RepState* st = ensureState(*rep);
     if (!st) return Result<SyncReport>::failure("no state for replication '" + replication + "'");
     std::lock_guard<std::mutex> op(st->opMutex);
@@ -1235,6 +1517,7 @@ Result<SyncReport> Engine::syncAccounts(const std::string& replication, bool dry
     auto accept = [&](const module::Account& account) {
         policy::Context actx = accountContext(account);
         policy::Decision d = policyEngine_.evaluate(st->bundle, policy::Category::Access, actx, rep->name);
+        LOG_DEBUG("replication '", rep->name, "': account ", account.accessKey, " access decision: ", d.toString());
         RouteInfo ri;
         ri.atSec = nowSec();
         ri.replication = rep->name;
@@ -1263,7 +1546,14 @@ Result<SyncReport> Engine::syncAccounts(const std::string& replication, bool dry
         return false;
     };
     auto report = accounts_.sync(*rep, dryRun, prune, accept);
-    if (report) stat.accountsSynced += report.value().created + report.value().updated;
+    if (report) {
+        stat.accountsSynced += report.value().created + report.value().updated;
+        LOG_INFO("replication '", replication, "': account sync", dryRun ? " (dry run)" : "", " created=",
+                 report.value().created, " updated=", report.value().updated, " deleted=", report.value().deleted,
+                 " matched=", report.value().matched);
+    } else {
+        LOG_ERROR("replication '", replication, "': account sync failed: ", report.error());
+    }
     return report;
 }
 

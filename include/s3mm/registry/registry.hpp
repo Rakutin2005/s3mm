@@ -26,7 +26,12 @@ struct Cluster {
     uint64_t partSize = 16ull * 1024 * 1024;
     int retries = 5;
     std::string description;
-    bool managed = true;                 // managed cluster with plugin/management API access
+    /// Managed cluster: s3mmd drives its management (admin) API through the
+    /// vendor module (account/IAM sync). Unmanaged clusters are used through
+    /// the S3 data plane only.
+    bool managed = true;
+    /// Management API endpoints (scheme://host:port); empty => same as `endpoints`.
+    std::vector<std::string> adminEndpoints;
 };
 
 struct Credential {

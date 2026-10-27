@@ -1,3 +1,4 @@
+#include "s3mm/common/time.hpp"
 #include "s3mm/common/units.hpp"
 #include "testkit.hpp"
 
@@ -69,4 +70,12 @@ TEST(units_parse_duration_seconds) {
     CHECK_EQ(units::parseDurationSeconds("90s"), 90);
     CHECK_EQ(units::parseDurationSeconds("1m30s"), 90);
     CHECK_EQ(units::parseDurationSeconds("1500ms"), 2); // rounds up
+}
+
+TEST(time_parse_http_date) {
+    auto t = tm::fromHttpDate("Tue, 20 Oct 2026 12:34:56 GMT");
+    CHECK(t.has_value());
+    CHECK_EQ(tm::toIso8601(*t), std::string("2026-10-20T12:34:56Z"));
+    CHECK(!tm::fromHttpDate("2026-10-20T12:34:56Z"));
+    CHECK(!tm::fromHttpDate(""));
 }

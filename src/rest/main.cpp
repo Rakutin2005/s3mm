@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <getopt.h>
 #include <string>
@@ -8,7 +9,7 @@
 namespace {
 void usage(std::FILE* out) {
     std::fprintf(out,
-                 "Usage: s3mm-rest [options]\n"
+                 "Usage: s3mmws [options]\n"
                  "\n"
                  "  -c, --config <file>     configuration file\n"
                  "  -s, --socket <path>     main daemon UNIX socket\n"
@@ -40,7 +41,16 @@ int main(int argc, char** argv) {
             case 'c': options.config = optarg; break;
             case 's': options.socket = optarg; break;
             case 'l': options.listen = optarg; break;
-            case 'p': options.port = std::stoi(optarg); break;
+            case 'p': {
+                char* end = nullptr;
+                long port = std::strtol(optarg, &end, 10);
+                if (!end || *end || port <= 0 || port > 65535) {
+                    std::fprintf(stderr, "s3mmws: invalid port '%s'\n", optarg);
+                    return 2;
+                }
+                options.port = (int)port;
+                break;
+            }
             case 'm': options.modulesDir = optarg; break;
             case 'd': options.daemonize = true; break;
             case 't': options.validateOnly = true; break;

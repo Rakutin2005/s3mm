@@ -1,0 +1,22 @@
+[Unit]
+Description=s3mm cluster client (s3mmc): mTLS peer mesh for s3mmd
+After=network-online.target s3mmd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/s3mmc -c /etc/s3mm/s3mmc.conf
+# s3mmc has no live reload: apply configuration changes with a restart.
+Restart=on-failure
+RestartSec=5
+# run_dir (default /var/run/s3mmc): control socket and remote-<id>.sock files
+RuntimeDirectory=s3mmc
+RuntimeDirectoryPreserve=yes
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/etc/s3mm /run/s3mm
+PrivateTmp=true
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

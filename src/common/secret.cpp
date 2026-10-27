@@ -5,6 +5,7 @@
 #include <openssl/evp.h>
 
 #include "s3mm/common/crypto.hpp"
+#include "s3mm/common/log.hpp"
 #include "s3mm/common/str.hpp"
 
 namespace s3mm::secret {
@@ -18,7 +19,9 @@ std::string seal(const std::string& plaintext, const std::string& passphrase) {
     std::string iv = crypto::randomBytes(12);
     auto key = crypto::pbkdf2(passphrase, salt, kIterations);
 
+    LOG_DEBUG("secret: sealing ", log::redact(plaintext));
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) LOG_ERROR("secret: EVP_CIPHER_CTX_new failed while sealing");
     std::string ciphertext(plaintext.size(), '\0');
     int len = 0, total = 0;
     EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr);
@@ -55,14 +58,25 @@ std::string seal(const std::string& plaintext, const std::string& passphrase) {
 Result<std::string> open(const std::string& pemBlock, const std::string& passphrase) {
     auto bpos = pemBlock.find(kBegin);
     auto epos = pemBlock.find(kEnd);
-    if (bpos == std::string::npos || epos == std::string::npos || epos < bpos)
+    if (bpos == std::string::npos || epos == std::string::npos || epos < bpos) {
+        LOG_WARN("secret: not an s3mm secret block");
         return Result<std::string>::failure("not an s3mm secret block");
+    }
     auto nl = pemBlock.find('\n', bpos);
     std::string body = pemBlock.substr(nl == std::string::npos ? epos : nl + 1, epos - (nl == std::string::npos ? bpos : nl + 1));
     auto blob = crypto::base64Decode(body);
-    if (!blob) return Result<std::string>::failure("invalid base64 in secret block");
-    if (blob->size() < 1 + 16 + 12 + 16) return Result<std::string>::failure("secret block too short");
-    if ((*blob)[0] != (char)1) return Result<std::string>::failure("unsupported secret block version");
+    if (!blob) {
+        LOG_WARN("secret: invalid base64 in secret block");
+        return Result<std::string>::failure("invalid base64 in secret block");
+    }
+    if (blob->size() < 1 + 16 + 12 + 16) {
+        LOG_WARN("secret: secret block too short");
+        return Result<std::string>::failure("secret block too short");
+    }
+    if ((*blob)[0] != (char)1) {
+        LOG_WARN("secret: unsupported secret block version");
+        return Result<std::string>::failure("unsupported secret block version");
+    }
 
     size_t off = 1;
     std::string_view salt(blob->data() + off, 16); off += 16;
@@ -86,8 +100,12 @@ Result<std::string> open(const std::string& pemBlock, const std::string& passphr
     int fin = 0;
     ok = ok && EVP_DecryptFinal_ex(ctx, reinterpret_cast<unsigned char*>(plaintext.data()) + total, &fin) == 1;
     EVP_CIPHER_CTX_free(ctx);
-    if (!ok) return Result<std::string>::failure("cannot decrypt secret (wrong passphrase or corrupted data)");
+    if (!ok) {
+        LOG_WARN("secret: cannot decrypt secret (wrong passphrase or corrupted data)");
+        return Result<std::string>::failure("cannot decrypt secret (wrong passphrase or corrupted data)");
+    }
     plaintext.resize((size_t)(total + fin));
+    LOG_DEBUG("secret: opened sealed block -> ", log::redact(plaintext));
     return Result<std::string>(std::move(plaintext));
 }
 
@@ -96,6 +114,7 @@ bool isPemBlock(const std::string& value) { return value.find(kBegin) != std::st
 std::string openMaybe(const std::string& value, const std::string& passphrase) {
     if (!isPemBlock(value)) return value;
     auto res = open(value, passphrase);
+    if (!res.ok()) LOG_WARN("secret: cannot open sealed value (", res.error(), "); using empty value");
     return res.ok() ? res.value() : std::string{};
 }
 

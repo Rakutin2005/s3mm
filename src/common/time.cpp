@@ -39,6 +39,14 @@ std::string toS3Time(TimePoint t) {
     return buf;
 }
 
+std::optional<TimePoint> fromHttpDate(std::string_view s) {
+    std::string t(s);
+    std::tm tm{};
+    const char* end = ::strptime(t.c_str(), "%a, %d %b %Y %H:%M:%S GMT", &tm);
+    if (!end || *end) return std::nullopt;
+    return Clock::from_time_t(::timegm(&tm));
+}
+
 std::optional<TimePoint> fromIso8601(std::string_view s) {
     std::string t(s);
     if (t.size() < 19) return std::nullopt;

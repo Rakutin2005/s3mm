@@ -1,0 +1,23 @@
+[Unit]
+Description=s3mm REST API daemon (s3mmws)
+After=network-online.target s3mmd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/s3mmws -c /etc/s3mm/s3mmws.conf
+# s3mmws has no live reload: apply configuration changes with a restart.
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=s3mm
+RuntimeDirectoryPreserve=yes
+CacheDirectory=s3mm
+StateDirectory=s3mm
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/etc/s3mm /var/cache/s3mm /run/s3mm -/var/lib/s3mmws
+PrivateTmp=true
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

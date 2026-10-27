@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <functional>
 #include <string>
 
@@ -6,6 +7,11 @@
 #include "s3mm/rest/module.hpp"
 
 namespace s3mm::rest {
+
+/// Sequence number of the request being handled (0 outside a request).
+uint64_t currentRequestId();
+/// "req#N " prefix for log lines that belong to the current request.
+std::string requestTag();
 
 class HttpServer {
 public:

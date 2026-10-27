@@ -200,7 +200,10 @@ public:
         std::string exportError;
         if (exported.ok() && exported.body.size() >= 2 && exported.body.compare(0, 2, "PK") == 0) {
             auto accounts = parseIamExport(exported.body, "minio");
-            if (accounts) return accounts;
+            if (accounts) {
+                LOG_DEBUG("minio listAccounts: ", accounts.value().size(), " account(s) from export-iam");
+                return accounts;
+            }
             exportError = accounts.error();
             LOG_WARN(accounts.error());
         } else if (exported.ok()) {
@@ -208,22 +211,31 @@ public:
             LOG_WARN("minio export-iam: ", exportError);
         } else {
             exportError = fail("export-iam", exported);
+            LOG_WARN(exportError, "; falling back to list-users");
         }
 
         http::Response r = call("GET", "/list-users");
-        if (!r.ok()) return Result<std::vector<Account>>::failure(fail("list-users", r));
+        if (!r.ok()) {
+            std::string err = fail("list-users", r);
+            LOG_ERROR(err);
+            return Result<std::vector<Account>>::failure(err);
+        }
         // madmin encrypts the list-users response body. Recognise the SIO
         // header instead of trying to JSON-parse binary data and returning a
         // misleading "unexpected token at offset 0".
-        if (r.body.size() > 32 && (unsigned char)r.body[32] <= 2)
+        if (r.body.size() > 32 && (unsigned char)r.body[32] <= 2) {
+            LOG_ERROR("minio list-users response is encrypted; a working export-iam endpoint is required (", exportError, ")");
             return Result<std::vector<Account>>::failure(
                 "minio list-users response is encrypted; a working export-iam endpoint is required (" +
                 exportError + ")");
+        }
         std::string err;
         Value root = Value::parseJson(r.body, &err);
-        if (!err.empty() || !root.isObject())
+        if (!err.empty() || !root.isObject()) {
+            LOG_ERROR("minio list-users: unparseable response: ", err, "; body: ", log::clip(r.body, 200));
             return Result<std::vector<Account>>::failure(
                 "minio list-users: unparseable response: " + err);
+        }
         std::vector<Account> out;
         for (const auto& [key, info] : root.members()) {
             Account a;
@@ -242,6 +254,7 @@ public:
                 for (const auto& it : g->items()) a.groups.push_back(it.asString());
             out.push_back(std::move(a));
         }
+        LOG_DEBUG("minio listAccounts: ", out.size(), " account(s) from list-users");
         return Result<std::vector<Account>>(std::move(out));
     }
 
@@ -250,26 +263,41 @@ public:
         if (!all) return Result<Account>::failure(all.error());
         for (auto& a : all.value())
             if (a.accessKey == accessKey) return Result<Account>(std::move(a));
+        LOG_DEBUG("minio getAccount: no account '", accessKey, "'");
         return Result<Account>::failure("minio: no account '" + accessKey + "'");
     }
 
     Result<void> createAccount(const Account& account) override {
-        if (account.accessKey.empty())
+        if (account.accessKey.empty()) {
+            LOG_ERROR("minio createAccount: empty access key");
             return Result<void>::failure("minio createAccount: empty access key");
+        }
+        LOG_DEBUG("minio createAccount ", account.accessKey, " status=", account.status, " policies=", account.policies.size(),
+                  " buckets=", account.buckets.size(), account.secretKey.empty() ? " (generated secret)" : "");
         std::string secret = account.secretKey.empty() ? randomSecret() : account.secretKey;
         Result<void> res = putUser(account.accessKey, secret, account.status);
         if (!res) return res;
         for (const auto& p : account.policies) {
+            LOG_DEBUG("minio createAccount ", account.accessKey, ": set-policy ", p);
             http::Response r =
                 call("PUT", "/set-policy", {{"user", account.accessKey}, {"policy", p}});
-            if (!r.ok()) return Result<void>::failure(fail("set-policy", r));
+            if (!r.ok()) {
+                std::string err = fail("set-policy", r);
+                LOG_ERROR(err);
+                return Result<void>::failure(err);
+            }
         }
+        LOG_INFO("minio: account ", account.accessKey, " created");
         if (!account.buckets.empty()) return setBucketAccess(account.accessKey, account.buckets);
         return Result<void>::success();
     }
 
     Result<void> setSecret(const std::string& accessKey, const std::string& secretKey) override {
-        if (secretKey.empty()) return Result<void>::failure("minio setSecret: empty secret");
+        if (secretKey.empty()) {
+            LOG_ERROR("minio setSecret ", accessKey, ": empty secret");
+            return Result<void>::failure("minio setSecret: empty secret");
+        }
+        LOG_INFO("minio: rotating secret of ", accessKey, " (new secret ", log::redact(secretKey), ")");
         // add-user overwrites the secret but may reset the account state:
         // remember the status first and restore it afterwards.
         std::string status = "enabled";
@@ -278,14 +306,18 @@ public:
     }
 
     Result<void> setStatus(const std::string& accessKey, const std::string& status) override {
-        if (status != "enabled" && status != "disabled")
+        LOG_INFO("minio: setStatus ", accessKey, " -> ", status);
+        if (status != "enabled" && status != "disabled") {
+            LOG_ERROR("minio setStatus: expected enabled|disabled, got '", status, "'");
             return Result<void>::failure("minio setStatus: expected enabled|disabled, got '" +
                                          status + "'");
+        }
         return setUserStatus(accessKey, status);
     }
 
     Result<void> setBucketAccess(const std::string& accessKey,
                                  const std::map<std::string, std::string>& buckets) override {
+        LOG_INFO("minio: setBucketAccess ", accessKey, " -> ", buckets.size(), " bucket(s)");
         if (buckets.empty()) return dropGrants(accessKey);
         Value doc = Value::object();
         doc.set("Version", Value::str("2012-10-17"));
@@ -298,6 +330,7 @@ public:
 
     Result<void> addBucketAccess(const std::string& accessKey, const std::string& bucket,
                                  const std::string& permissions) override {
+        LOG_INFO("minio: addBucketAccess ", accessKey, " bucket=", bucket, " permissions=", permissions);
         Value doc = readGrants(accessKey);
         if (!doc.isObject()) doc = emptyPolicy();
         setStatement(doc, bucket, &permissions);
@@ -306,8 +339,12 @@ public:
 
     Result<void> removeBucketAccess(const std::string& accessKey,
                                     const std::string& bucket) override {
+        LOG_INFO("minio: removeBucketAccess ", accessKey, " bucket=", bucket);
         Value doc = readGrants(accessKey);
-        if (!doc.isObject()) return Result<void>::success(); // nothing to remove
+        if (!doc.isObject()) {
+            LOG_DEBUG("minio removeBucketAccess ", accessKey, ": no grant policy, nothing to remove");
+            return Result<void>::success(); // nothing to remove
+        }
         setStatement(doc, bucket, nullptr);
         const Value* stmts = doc.find("Statement");
         if (!stmts || stmts->items().empty()) return dropGrants(accessKey);
@@ -321,8 +358,13 @@ public:
         arr.push(Value::str(policyName));
         body.set("policies", std::move(arr));
         body.set("user", Value::str(accessKey));
+        LOG_INFO("minio: attach policy ", policyName, " to ", accessKey);
         http::Response r = call("POST", "/idp/builtin/policy/attach", {}, body.toJson(0));
-        if (!r.ok()) return Result<void>::failure(fail("attach-policy", r));
+        if (!r.ok()) {
+            std::string err = fail("attach-policy", r);
+            LOG_ERROR(err);
+            return Result<void>::failure(err);
+        }
         return Result<void>::success();
     }
 
@@ -333,8 +375,13 @@ public:
         arr.push(Value::str(policyName));
         body.set("policies", std::move(arr));
         body.set("user", Value::str(accessKey));
+        LOG_INFO("minio: detach policy ", policyName, " from ", accessKey);
         http::Response r = call("POST", "/idp/builtin/policy/detach", {}, body.toJson(0));
-        if (!r.ok() && r.status != 404) return Result<void>::failure(fail("detach-policy", r));
+        if (!r.ok() && r.status != 404) {
+            std::string err = fail("detach-policy", r);
+            LOG_ERROR(err);
+            return Result<void>::failure(err);
+        }
         return Result<void>::success();
     }
 
@@ -342,6 +389,7 @@ public:
                            const std::vector<std::string>& current) override {
         std::set<std::string> want(desired.begin(), desired.end());
         std::set<std::string> have(current.begin(), current.end());
+        LOG_DEBUG("minio setGroups ", accessKey, ": desired=", desired.size(), " current=", current.size());
         for (const auto& group : have) {
             if (want.count(group)) continue;
             auto res = updateGroup(group, accessKey, true);
@@ -356,9 +404,15 @@ public:
     }
 
     Result<void> deleteAccount(const std::string& accessKey) override {
+        LOG_INFO("minio: deleting account ", accessKey);
         http::Response r = call("DELETE", "/remove-user", {{"accessKey", accessKey}});
-        if (!r.ok()) return Result<void>::failure(fail("remove-user", r));
+        if (!r.ok()) {
+            std::string err = fail("remove-user", r);
+            LOG_ERROR(err);
+            return Result<void>::failure(err);
+        }
         dropGrants(accessKey); // best effort: the grant policy is orphaned otherwise
+        LOG_INFO("minio: account ", accessKey, " deleted");
         return Result<void>::success();
     }
 
@@ -375,7 +429,14 @@ private:
         req.headers = headers;
         req.timeoutSec = client_.options().timeoutSec;
         req.connectTimeoutSec = client_.options().connectTimeoutSec;
-        return client_.raw(req);
+        std::string q;
+        for (const auto& [k, v] : query) q += (q.empty() ? "?" : "&") + k + "=" + v;
+        LOG_DEBUG("minio admin: ", method, " ", path, q, " body=", body.size(), "B");
+        log::Stopwatch sw;
+        http::Response r = client_.raw(req);
+        LOG_DEBUG("minio admin: ", method, " ", path, " -> ", r.ok() ? std::to_string(r.status) : r.errorText(), " ",
+                  r.body.size(), "B in ", sw.ms(), " ms");
+        return r;
     }
 
     static std::string fail(const char* op, const http::Response& r) {
@@ -389,6 +450,7 @@ private:
     }
 
     Result<void> updateGroup(const std::string& group, const std::string& accessKey, bool remove) {
+        LOG_INFO("minio: ", remove ? "removing " : "adding ", accessKey, remove ? " from group " : " to group ", group);
         Value body = Value::object();
         body.set("group", Value::str(group));
         Value members = Value::array();
@@ -397,7 +459,11 @@ private:
         body.set("groupStatus", Value::str("enabled"));
         body.set("isRemove", Value::boolean(remove));
         http::Response r = call("PUT", "/update-group-members", {}, body.toJson());
-        if (!r.ok()) return Result<void>::failure(fail("update-group-members", r));
+        if (!r.ok()) {
+            std::string err = fail("update-group-members", r);
+            LOG_ERROR(err);
+            return Result<void>::failure(err);
+        }
         return Result<void>::success();
     }
 
@@ -409,17 +475,28 @@ private:
                           std::string("\"}");
         std::string body;
         try { body = madminEncrypt(credentials_.secretKey, json); }
-        catch (const std::exception& e) { return Result<void>::failure(std::string("minio add-user: ") + e.what()); }
+        catch (const std::exception& e) {
+            LOG_ERROR("minio add-user ", accessKey, ": cannot encrypt request body: ", e.what());
+            return Result<void>::failure(std::string("minio add-user: ") + e.what());
+        }
         http::Response r = call("PUT", "/add-user", {{"accessKey", accessKey}}, body,
                                 {{"Content-Type", "application/octet-stream"}});
-        if (!r.ok()) return Result<void>::failure(fail("add-user", r));
+        if (!r.ok()) {
+            std::string err = fail("add-user", r);
+            LOG_ERROR(err);
+            return Result<void>::failure(err);
+        }
         return setUserStatus(accessKey, status.empty() ? "enabled" : status);
     }
 
     Result<void> setUserStatus(const std::string& accessKey, const std::string& status) {
         const std::string st = status == "disabled" || status == "off" ? "disabled" : "enabled";
         http::Response r = call("PUT", "/set-user-status", {{"accessKey", accessKey}, {"status", st}}, "");
-        if (!r.ok()) return Result<void>::failure(fail("set-user-status", r));
+        if (!r.ok()) {
+            std::string err = fail("set-user-status", r);
+            LOG_ERROR(err);
+            return Result<void>::failure(err);
+        }
         return Result<void>::success();
     }
 
@@ -476,7 +553,7 @@ private:
         std::string err;
         Value v = Value::parseJson(r.body, &err);
         if (!err.empty()) {
-            LOG_WARN("minio info-canned-policy: unparseable policy of ", accessKey);
+            LOG_WARN("minio info-canned-policy: unparseable policy of ", accessKey, ": ", err);
             return Value::null();
         }
         return v;
@@ -484,15 +561,25 @@ private:
 
     Result<void> putGrants(const std::string& accessKey, const Value& doc) {
         const std::string name = std::string(kGrantPrefix) + accessKey;
+        LOG_DEBUG("minio putGrants ", accessKey, ": policy ", name);
         http::Response r = call("PUT", "/add-canned-policy", {{"name", name}}, doc.toJson(0));
-        if (!r.ok()) return Result<void>::failure(fail("add-canned-policy", r));
+        if (!r.ok()) {
+            std::string err = fail("add-canned-policy", r);
+            LOG_ERROR(err);
+            return Result<void>::failure(err);
+        }
         http::Response r2 = call("PUT", "/set-policy", {{"user", accessKey}, {"policy", name}});
-        if (!r2.ok()) return Result<void>::failure(fail("set-policy", r2));
+        if (!r2.ok()) {
+            std::string err = fail("set-policy", r2);
+            LOG_ERROR(err);
+            return Result<void>::failure(err);
+        }
         return Result<void>::success();
     }
 
     Result<void> dropGrants(const std::string& accessKey) {
         const std::string name = std::string(kGrantPrefix) + accessKey;
+        LOG_DEBUG("minio dropGrants ", accessKey, ": policy ", name);
         http::Response r = call("DELETE", "/remove-policy", {{"user", accessKey}, {"policy", name}});
         if (!r.ok() && r.status != 404)
             LOG_WARN("minio remove-policy: HTTP ", r.status, " for ", accessKey);
@@ -517,15 +604,21 @@ public:
             opts.service = "s3";      // the admin plane signs as "s3" (madmin-go)
             sigv4::Credentials creds = credentials;
             creds.region.clear();     // madmin-go signs admin calls with an empty region
+            LOG_INFO("minio: admin provider created for ", opts.endpoints.empty() ? std::string("<no endpoint>") : opts.endpoints.front(),
+                     " (access_key=", creds.accessKey, ")");
             return Result<std::unique_ptr<IAdminProvider>>(
                 std::make_unique<MinioAdmin>(opts, creds));
         } catch (const std::exception& e) {
+            LOG_ERROR("minio: cannot create admin provider: ", e.what());
             return Result<std::unique_ptr<IAdminProvider>>::failure(
                 std::string("minio: ") + e.what());
         }
     }
 
-    void adjustClientOptions(s3::ClientOptions& opts) override { opts.service = "s3"; }
+    void adjustClientOptions(s3::ClientOptions& opts) override {
+        opts.service = "s3";
+        LOG_DEBUG("minio: client options adjusted: service=", opts.service);
+    }
 };
 
 } // namespace

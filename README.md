@@ -37,7 +37,7 @@ logs exclusively to syslog (RFC 5424), runs under systemd, and keeps all state u
 change authentication, request processing and add endpoints. It has no GUI.
 
 ```text
-s3mmws -c /etc/s3mm/s3mm.conf -l 127.0.0.1 -p 8080
+s3mmws -c /etc/s3mm/s3mmws.conf -l 127.0.0.1 -p 8080
 ```
 
 Endpoints: `/health`, `/status`, `/modules`, `/replications`, `/rpc` (POST JSON command).
@@ -95,8 +95,8 @@ Installs to `/usr/bin`, `/usr/lib/s3mm/modules`, `/etc/s3mm`, `/usr/lib/systemd/
 
 ## Quick start
 
-1. Copy `etc/s3mm.conf` to `/etc/s3mm/s3mm.conf` and edit clusters/credentials.
-2. `s3mmd -t -c /etc/s3mm/s3mm.conf` — validate.
+1. Copy `etc/s3mm/` to `/etc/s3mm/` and edit clusters/credentials (`s3mmd.d/20-clusters.conf`, `s3mmd.d/25-credentials.conf`).
+2. `s3mmd -t -c /etc/s3mm/s3mmd.conf` — validate.
 3. `systemctl enable --now s3mmd`
 4. `s3mm status`
 5. `s3mm add cluster ...`, `s3mm add replication ...`, `s3mm scan`

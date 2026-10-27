@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cerrno>
 #include <cstring>
 #include <mutex>
 
@@ -11,13 +12,39 @@
 
 #include <curl/curl.h>
 
+#include "s3mm/common/log.hpp"
 #include "s3mm/common/str.hpp"
 
 namespace s3mm::http {
 
 void initGlobal() {
     static std::once_flag once;
-    std::call_once(once, [] { curl_global_init(CURL_GLOBAL_ALL); });
+    std::call_once(once, [] {
+        CURLcode rc = curl_global_init(CURL_GLOBAL_ALL);
+        if (rc != CURLE_OK) LOG_ERROR("http: curl_global_init failed: ", curl_easy_strerror(rc), " (code ", (int)rc, ")");
+        else LOG_DEBUG("http: curl initialised: ", curl_version());
+    });
+}
+
+static std::string redactUrl(const std::string& url) {
+    static const char* sensitive[] = {"x-amz-signature", "x-amz-credential", "x-amz-security-token"};
+    auto q = url.find('?');
+    if (q == std::string::npos) return url;
+    std::string out = url.substr(0, q + 1);
+    size_t pos = q + 1;
+    while (pos <= url.size()) {
+        size_t amp = url.find('&', pos);
+        std::string part = url.substr(pos, amp == std::string::npos ? std::string::npos : amp - pos);
+        auto eq = part.find('=');
+        std::string key = str::toLower(part.substr(0, eq));
+        bool hide = false;
+        for (const char* s : sensitive) hide = hide || key == s;
+        out += (hide && eq != std::string::npos) ? part.substr(0, eq + 1) + "***" : part;
+        if (amp == std::string::npos) break;
+        out += '&';
+        pos = amp + 1;
+    }
+    return out;
 }
 
 Client::Client() { initGlobal(); }
@@ -106,12 +133,16 @@ struct FileSinkState {
     std::FILE* file = nullptr;
     int64_t limit = 0;      // 0 = unlimited
     int64_t written = 0;
+    bool overflow = false;
 };
 
 static size_t fileWriteCallback(char* ptr, size_t size, size_t nmemb, void* userdata) {
     auto* st = static_cast<FileSinkState*>(userdata);
     size_t total = size * nmemb;
-    if (st->limit > 0 && st->written + (int64_t)total > st->limit) return 0; // abort: response too large
+    if (st->limit > 0 && st->written + (int64_t)total > st->limit) { // abort: response too large
+        st->overflow = true;
+        return 0;
+    }
     size_t n = std::fwrite(ptr, 1, total, st->file);
     st->written += (int64_t)n;
     return n; // < total aborts the transfer
@@ -138,8 +169,10 @@ Response Client::send(const Request& request) { return perform(request, nullptr)
 
 Response Client::downloadToFile(const Request& request, const std::string& path) {
     std::string tmp = path + ".part";
+    LOG_DEBUG("http: download ", request.method, " ", redactUrl(request.url), " -> ", path);
     std::FILE* f = std::fopen(tmp.c_str(), "wb");
     if (!f) {
+        LOG_ERROR("http: cannot open download temp file ", tmp, " for writing: ", std::strerror(errno));
         Response r;
         r.curlError = "cannot open " + tmp + " for writing";
         return r;
@@ -148,10 +181,12 @@ Response Client::downloadToFile(const Request& request, const std::string& path)
     std::fclose(f);
     if (r.ok()) {
         if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+            LOG_ERROR("http: cannot rename ", tmp, " -> ", path, ": ", std::strerror(errno));
             r.status = 0;
             r.curlError = "cannot rename " + tmp;
         }
     } else {
+        LOG_DEBUG("http: download to ", path, " failed (", r.errorText(), "), removing ", tmp);
         std::remove(tmp.c_str());
     }
     return r;
@@ -161,6 +196,7 @@ Response Client::perform(const Request& request, void* curlFile) {
     Response response;
     CURL* curl = curl_easy_init();
     if (!curl) {
+        LOG_ERROR("http: curl_easy_init failed for ", request.method, " ", redactUrl(request.url));
         response.curlError = "curl_easy_init failed";
         return response;
     }
@@ -175,6 +211,7 @@ Response Client::perform(const Request& request, void* curlFile) {
     if (url.rfind("unix:", 0) == 0) {
         auto hash = url.find('#');
         if (hash == std::string::npos) {
+            LOG_ERROR("http: malformed unix endpoint (missing '#'): ", redactUrl(url));
             response.curlError = "malformed unix endpoint (missing '#'): " + url;
             curl_easy_cleanup(curl);
             return response;
@@ -202,6 +239,20 @@ Response Client::perform(const Request& request, void* curlFile) {
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, (long)request.connectTimeoutSec);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "s3mm/0.1");
+    char errbuf[CURL_ERROR_SIZE];
+    errbuf[0] = '\0';
+    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
+
+    const std::string logUrl = redactUrl(url);
+    const char* transport = unixSocketPath.empty() ? "tcp" : "unix";
+    LOG_DEBUG("http: ", request.method, " ", logUrl, " via ", transport,
+              unixSocketPath.empty() ? std::string() : " socket=/" + unixSocketPath,
+              " timeout=", request.timeoutSec, "s connect_timeout=", request.connectTimeoutSec, "s",
+              request.insecure ? " tls_verify=off" : "",
+              request.range.empty() ? std::string() : " range=" + request.range,
+              request.bodyFile.empty() ? " body=" + std::to_string(request.body.size()) + "B" : " body_file=" + request.bodyFile,
+              " headers=", request.headers.size(),
+              request.maxResponseBytes > 0 ? " max_response=" + std::to_string(request.maxResponseBytes) : std::string());
 
     struct curl_slist* hdrs = nullptr;
     for (const auto& [k, v] : request.headers) hdrs = curl_slist_append(hdrs, (k + ": " + v).c_str());
@@ -221,6 +272,7 @@ Response Client::perform(const Request& request, void* curlFile) {
     if (!request.bodyFile.empty()) {
         readState.file = std::fopen(request.bodyFile.c_str(), "rb");
         if (!readState.file) {
+            LOG_ERROR("http: cannot open body file ", request.bodyFile, " for ", request.method, " ", logUrl, ": ", std::strerror(errno));
             response.curlError = "cannot open body file " + request.bodyFile;
             curl_slist_free_all(hdrs);
             curl_easy_cleanup(curl);
@@ -230,7 +282,12 @@ Response Client::perform(const Request& request, void* curlFile) {
         curl_easy_setopt(curl, CURLOPT_READFUNCTION, readCallback);
         curl_easy_setopt(curl, CURLOPT_READDATA, &readState);
         struct stat st{};
-        if (fstat(fileno(readState.file), &st) == 0) curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, (curl_off_t)st.st_size);
+        if (fstat(fileno(readState.file), &st) == 0) {
+            curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, (curl_off_t)st.st_size);
+            LOG_DEBUG("http: streaming body file ", request.bodyFile, " (", (long long)st.st_size, " bytes)");
+        } else {
+            LOG_WARN("http: fstat on body file ", request.bodyFile, " failed: ", std::strerror(errno), "; size unknown");
+        }
     } else if (request.method == "POST" || request.method == "PUT" || request.method == "DELETE") {
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request.body.data());
         curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)request.body.size());
@@ -244,8 +301,9 @@ Response Client::perform(const Request& request, void* curlFile) {
     struct SinkState {
         std::string* data;
         int64_t limit;
-    } sinkState{&sink, request.maxResponseBytes};
-    FileSinkState fileState{static_cast<std::FILE*>(curlFile), request.maxResponseBytes, 0};
+        bool overflow;
+    } sinkState{&sink, request.maxResponseBytes, false};
+    FileSinkState fileState{static_cast<std::FILE*>(curlFile), request.maxResponseBytes, 0, false};
     if (curlFile) {
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &fileState);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, fileWriteCallback);
@@ -254,7 +312,10 @@ Response Client::perform(const Request& request, void* curlFile) {
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +[](char* ptr, size_t size, size_t nmemb, void* userdata) -> size_t {
             auto* st = static_cast<SinkState*>(userdata);
             size_t total = size * nmemb;
-            if (st->limit > 0 && (int64_t)(st->data->size() + total) > st->limit) return 0; // abort: response too large
+            if (st->limit > 0 && (int64_t)(st->data->size() + total) > st->limit) { // abort: response too large
+                st->overflow = true;
+                return 0;
+            }
             st->data->append(ptr, total);
             return total;
         });
@@ -269,10 +330,28 @@ Response Client::perform(const Request& request, void* curlFile) {
     if (readState.file) std::fclose(readState.file);
     if (rc != CURLE_OK) {
         response.status = 0;
-        response.curlError = curl_easy_strerror(rc);
+        const bool tooLarge = rc == CURLE_WRITE_ERROR && (curlFile ? fileState.overflow : sinkState.overflow);
+        response.curlError = tooLarge
+            ? "response exceeds " + std::to_string(request.maxResponseBytes) + " bytes limit"
+            : std::string(curl_easy_strerror(rc));
+        LOG_ERROR("http: ", request.method, " ", logUrl, " via ", transport,
+                  unixSocketPath.empty() ? std::string() : " (/" + unixSocketPath + ")",
+                  " failed after ", (long long)(response.totalSeconds * 1000), " ms: curl error ", (int)rc, " ",
+                  response.curlError, errbuf[0] ? std::string(" (") + errbuf + ")" : std::string(),
+                  tooLarge ? std::string(" [") + curl_easy_strerror(rc) + "]" : std::string());
     } else {
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response.status);
+        int64_t size = curlFile ? fileState.written : (int64_t)sink.size();
         if (!curlFile) response.body = std::move(sink);
+        long long ms = (long long)(response.totalSeconds * 1000);
+        if (response.ok()) {
+            LOG_DEBUG("http: ", request.method, " ", logUrl, " -> ", response.status, " ", size, " bytes in ", ms, " ms (", transport, ")");
+        } else if (response.status == 404 && (request.method == "HEAD" || request.method == "GET")) {
+            LOG_DEBUG("http: ", request.method, " ", logUrl, " -> 404 ", size, " bytes in ", ms, " ms (", transport, ")");
+        } else {
+            LOG_WARN("http: ", request.method, " ", logUrl, " -> HTTP ", response.status, " ", size, " bytes in ", ms, " ms (", transport, ")",
+                     (!curlFile && !response.body.empty()) ? " body: " + log::clip(response.body) : std::string());
+        }
     }
     curl_slist_free_all(hdrs);
     curl_easy_cleanup(curl);

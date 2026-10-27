@@ -15,6 +15,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -46,19 +47,26 @@ void usage(std::FILE* out) {
 std::string controlQuery(const std::string& runDir, const std::string& nodeId,
                          const std::string& request, std::string* error) {
     std::string path = runDir + "/" + nodeId + "/s3mmc.sock";
+    LOG_DEBUG("cli: control query to ", path, ": ", request);
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) { *error = "socket: " + std::string(strerror(errno)); return {}; }
+    if (fd < 0) {
+        *error = "socket: " + std::string(strerror(errno));
+        LOG_ERROR("cli: ", *error);
+        return {};
+    }
     sockaddr_un un{};
     un.sun_family = AF_UNIX;
     std::strncpy(un.sun_path, path.c_str(), sizeof(un.sun_path) - 1);
     if (::connect(fd, reinterpret_cast<sockaddr*>(&un), sizeof(un)) < 0) {
         *error = "cannot reach " + path + ": " + strerror(errno);
+        LOG_ERROR("cli: ", *error);
         ::close(fd);
         return {};
     }
     std::string req = request + "\n";
     if (::send(fd, req.data(), req.size(), MSG_NOSIGNAL) != (ssize_t)req.size()) {
         *error = "send failed";
+        LOG_ERROR("cli: control request to ", path, " send failed: ", strerror(errno));
         ::close(fd);
         return {};
     }
@@ -69,11 +77,17 @@ std::string controlQuery(const std::string& runDir, const std::string& nodeId,
         line.push_back(c);
     }
     ::close(fd);
+    if (line.empty()) {
+        LOG_ERROR("cli: no reply from ", path);
+    } else {
+        LOG_DEBUG("cli: control reply ", line.size(), " bytes");
+    }
     return line;
 }
 
 /// Send one control frame to the running instance and print the reply.
 int runStatus(const std::string& runDir, const std::string& nodeId, bool json) {
+    LOG_INFO("cli: status of node '", nodeId, "'", json ? " (json)" : "");
     std::string err;
     std::string line = controlQuery(runDir, nodeId, "{\"cmd\":\"status\"}", &err);
     if (line.empty()) {
@@ -109,6 +123,7 @@ int runStatus(const std::string& runDir, const std::string& nodeId, bool json) {
 
 int runVisibility(const std::string& runDir, const std::string& nodeId,
                   const std::string& peer, bool json) {
+    LOG_INFO("cli: visibility of peer '", peer, "' on node '", nodeId, "'", json ? " (json)" : "");
     std::string req = "{\"cmd\":\"visibility\",\"peer\":\"" + peer + "\"}";
     std::string err;
     std::string line = controlQuery(runDir, nodeId, req, &err);
@@ -119,6 +134,7 @@ int runVisibility(const std::string& runDir, const std::string& nodeId,
     if (json) { std::printf("%s\n", line.c_str()); return 0; }
     auto v = s3mm::Value::parseJson(line);
     if (!v.isObject() || (v.find("ok") && !v.find("ok")->asBool())) {
+        LOG_ERROR("cli: visibility of '", peer, "' failed: ", v.getString("error"));
         std::fprintf(stderr, "s3mmc: %s\n", v.getString("error").c_str());
         return 1;
     }
@@ -142,6 +158,12 @@ int runVisibility(const std::string& runDir, const std::string& nodeId,
 } // namespace
 
 int main(int argc, char** argv) {
+    {
+        s3mm::log::Options bootstrap;
+        bootstrap.ident = "s3mmc";
+        bootstrap.level = s3mm::log::Level::Info;
+        s3mm::log::init(bootstrap);
+    }
     std::string configPath = "/etc/s3mmc/s3mmc.conf";
     bool jsonOut = false;
     std::string command;
@@ -166,10 +188,14 @@ int main(int argc, char** argv) {
                 std::printf("s3mmc\n");
 #endif
                 return 0;
-            default: usage(stderr); return 2;
+            default:
+                LOG_ERROR("invalid command line option");
+                usage(stderr);
+                return 2;
         }
     }
     if (optind < argc) command = argv[optind++];
+    LOG_DEBUG("s3mmc: command '", command.empty() ? "run" : command, "' config ", configPath);
 
     using namespace s3mm::s3mmc;
 
@@ -177,9 +203,17 @@ int main(int argc, char** argv) {
     TlsConfig tls;
     ClusterClient client(opts, tls);
 
-    if (auto r = applyConfigFile(client, configPath); !r) {
+    std::optional<s3mm::log::Options> logOpts;
+    if (auto r = applyConfigFile(client, configPath, &logOpts); !r) {
+        LOG_CRITICAL("s3mmc: configuration ", configPath, " failed: ", r.error());
         std::fprintf(stderr, "s3mmc: %s\n", r.error().c_str());
         return 1;
+    }
+    client.setConfigPath(configPath);
+    if (logOpts) {
+        s3mm::log::init(*logOpts);
+        LOG_INFO("s3mmc: logging re-initialised: level=", s3mm::log::levelName(logOpts->level), " facility=",
+                 s3mm::log::facilityName(logOpts->facility), " socket=", logOpts->socketPath);
     }
 
     if (command == "status") {
@@ -189,23 +223,26 @@ int main(int argc, char** argv) {
     if (command == "visibility") {
         auto cur = client.options();
         if (optind >= argc) {
+            LOG_ERROR("cli: visibility: <peer-id> required");
             std::fprintf(stderr, "s3mmc visibility: <peer-id> required\n");
             return 2;
         }
         return runVisibility(cur.runDir, cur.nodeId, argv[optind], jsonOut);
     }
     if (!command.empty()) {
+        LOG_ERROR("s3mmc: unknown command '", command, "'");
         std::fprintf(stderr, "s3mmc: unknown command '%s'\n", command.c_str());
         usage(stderr);
         return 2;
     }
 
+    LOG_NOTICE("s3mmc: starting node '", client.options().nodeId, "' (config ", configPath, ")");
     auto sr = client.start();
     if (!sr) {
-        std::fprintf(stderr, "s3mmc: start failed: %s\n", sr.error().c_str());
+        LOG_CRITICAL("s3mmc: start failed: ", sr.error());
         return 1;
     }
-    std::fprintf(stderr, "s3mmc: node '%s' running\n", client.options().nodeId.c_str());
+    LOG_NOTICE("s3mmc: node '", client.options().nodeId, "' running");
 
     // block forever; SIGTERM/SIGINT default disposition stops the process,
     // stop() runs from the destructor for graceful cleanup.

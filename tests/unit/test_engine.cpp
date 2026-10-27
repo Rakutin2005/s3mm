@@ -105,3 +105,34 @@ TEST(engine_routes_success_default) {
     // empty success route => <replication>-rqueue
     CHECK_EQ(d.target, std::string("rep1-rqueue"));
 }
+
+TEST(engine_default_redirect_without_target_denied) {
+    Bundle b;
+    b.name = "test";
+    b.defaults[Category::Object] = Action{"redirect", {}, {}};
+    b.routes.denied = "deny-batch";
+    Engine e;
+    Context ctx;
+    Decision d = e.evaluate(b, Category::Object, ctx, "rep1");
+    CHECK(d.viaDefault);
+    CHECK(!d.accepted());
+    CHECK_EQ(d.outcome, std::string("denied"));
+    CHECK_EQ(d.target, std::string("deny-batch"));
+
+    b.routes.denied.clear();
+    Decision d2 = e.evaluate(b, Category::Object, ctx, "rep1");
+    CHECK_EQ(d2.outcome, std::string("denied"));
+    CHECK_EQ(d2.target, std::string("null"));
+}
+
+TEST(engine_default_redirect_with_target) {
+    Bundle b;
+    b.name = "test";
+    b.defaults[Category::Object] = Action{"redirect", "special-batch", {}};
+    Engine e;
+    Context ctx;
+    Decision d = e.evaluate(b, Category::Object, ctx, "rep1");
+    CHECK(d.viaDefault);
+    CHECK_EQ(d.outcome, std::string("success"));
+    CHECK_EQ(d.target, std::string("special-batch"));
+}

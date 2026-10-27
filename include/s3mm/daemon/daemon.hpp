@@ -1,5 +1,8 @@
 #pragma once
 #include <atomic>
+#include <future>
+#include <mutex>
+#include <vector>
 #include <memory>
 #include <string>
 
@@ -12,7 +15,7 @@
 namespace s3mm::daemon {
 
 struct Options {
-    std::string config = "/etc/s3mm/s3mm.conf";
+    std::string config = "/etc/s3mm/s3mmd.conf";
     std::string socket;      // empty => settings.socket
     std::string pidFile;     // empty => settings.pidFile
     bool daemonize = false;
@@ -61,6 +64,10 @@ private:
     std::string flushConfig();
     /// Log a configuration change (audit trail, answer #58).
     void audit(const std::string& what);
+    /// Check availability of the named clusters (all when empty) in the
+    /// background, on a snapshot of the registry; results go to the log.
+    void probeClustersAsync(std::vector<std::string> names, const std::string& why);
+    void waitForProbes();
 
     Options options_;
     std::unique_ptr<module::Loader> loader_;
@@ -72,6 +79,8 @@ private:
     int signalFd_ = -1; // self-pipe for signal handling
     bool running_ = false;
     std::string loadedConfigPath_;
+    std::mutex probesMutex_;
+    std::vector<std::future<void>> probes_;
 };
 
 } // namespace s3mm::daemon

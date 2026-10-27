@@ -3,6 +3,7 @@
 #include <getopt.h>
 #include <string>
 
+#include "s3mm/common/log.hpp"
 #include "s3mm/daemon/daemon.hpp"
 
 namespace {
@@ -11,7 +12,7 @@ void usage(std::FILE* out) {
     std::fprintf(out,
                  "Usage: s3mmd [options]\n"
                  "\n"
-                 "  -c, --config <file>   configuration file (default /etc/s3mm/s3mm.conf)\n"
+                 "  -c, --config <file>   configuration file (default /etc/s3mm/s3mmd.conf)\n"
                  "  -d, --daemonize       run in the background\n"
                  "  -t, --test            validate the configuration and exit\n"
                  "      --run-once        single replication cycle and exit\n"
@@ -22,6 +23,10 @@ void usage(std::FILE* out) {
 } // namespace
 
 int main(int argc, char** argv) {
+    s3mm::log::Options logOptions;
+    logOptions.ident = "s3mmd";
+    s3mm::log::init(logOptions);
+
     s3mm::daemon::Options options;
 
     static const option longOptions[] = {
@@ -49,15 +54,23 @@ int main(int argc, char** argv) {
                 std::printf("s3mmd\n");
 #endif
                 return 0;
-            default: usage(stderr); return 2;
+            default:
+                LOG_ERROR("invalid command line option (", argv[optind > 0 ? optind - 1 : 0], ")");
+                usage(stderr);
+                return 2;
         }
     }
     if (optind < argc) {
+        LOG_ERROR("unexpected command line argument '", argv[optind], "'");
         std::fprintf(stderr, "s3mmd: unexpected argument '%s'\n", argv[optind]);
         usage(stderr);
         return 2;
     }
 
+    LOG_DEBUG("command line parsed: config=", options.config, " daemonize=", options.daemonize ? "yes" : "no",
+              " validate=", options.validateOnly ? "yes" : "no", " run_once=", options.runOnce ? "yes" : "no");
     s3mm::daemon::Daemon daemon(std::move(options));
-    return daemon.run();
+    int rc = daemon.run();
+    LOG_INFO("s3mmd exiting with status ", rc);
+    return rc;
 }

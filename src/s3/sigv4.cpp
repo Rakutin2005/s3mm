@@ -7,6 +7,7 @@
 #include <map>
 
 #include "s3mm/common/crypto.hpp"
+#include "s3mm/common/log.hpp"
 #include "s3mm/common/str.hpp"
 
 namespace s3mm::sigv4 {
@@ -76,6 +77,9 @@ SigningResult signAt(http::Request& request, const Credentials& creds, const std
         if (!defaultPort && !parts.port.empty()) host += ":" + parts.port;
     }
 
+    if (host.empty()) LOG_WARN("sigv4: cannot determine Host for ", request.method, " ", parts.scheme == "unix" ? "unix endpoint" : request.url);
+    if (creds.accessKey.empty()) LOG_WARN("sigv4: signing ", request.method, " for host ", host, " with an empty access key id");
+
     // payload hash
     if (!request.payloadHash.empty()) out.payloadHash = request.payloadHash;
     else if (request.unsignedPayload || !request.bodyFile.empty()) out.payloadHash = "UNSIGNED-PAYLOAD";
@@ -128,6 +132,9 @@ SigningResult signAt(http::Request& request, const Credentials& creds, const std
     request.headers["x-amz-date"] = amzDateTime;
     if (!creds.sessionToken.empty()) request.headers["x-amz-security-token"] = creds.sessionToken;
     request.headers["Authorization"] = out.authorization;
+    LOG_DEBUG("sigv4: signed ", request.method, " host=", host, " access_key=", creds.accessKey, " region=", creds.region,
+              " service=", service, " date=", amzDateTime, creds.sessionToken.empty() ? "" : " session_token=yes",
+              " payload=", out.payloadHash == "UNSIGNED-PAYLOAD" ? "unsigned" : "sha256");
     return out;
 }
 
@@ -136,9 +143,7 @@ SigningResult sign(http::Request& request, const Credentials& creds, const std::
     std::tm tmv{};
     ::gmtime_r(&tt, &tmv);
     char buf[32];
-    std::snprintf(buf, sizeof buf, "%04d%02d%02dT%02d%02d%02dZ",
-                  tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
-                  tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    std::strftime(buf, sizeof buf, "%Y%m%dT%H%M%SZ", &tmv);
     return signAt(request, creds, service, buf);
 }
 

@@ -2,6 +2,8 @@
 #include "s3mm/common/log.hpp"
 
 #include <atomic>
+#include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <mutex>
@@ -69,6 +71,17 @@ const char* facilityName(Facility f) {
 
 static int facilityNumber(Facility f) { return (int)f * 8; }
 
+static std::string g_hostname = "localhost";
+
+// Caller holds g_mutex.
+static void closeSyslogSocket() {
+    if (g_fd >= 0) {
+        ::close(g_fd);
+        g_fd = -1;
+    }
+}
+
+// Caller holds g_mutex.
 static bool openSyslogSocket() {
     if (g_fd >= 0) return true;
     struct sockaddr_un addr{};
@@ -87,23 +100,36 @@ static bool openSyslogSocket() {
 
 void init(const Options& options) {
     std::lock_guard<std::mutex> lock(g_mutex);
+    closeSyslogSocket();
     g_options = options;
+    char host[256] = "localhost";
+    if (::gethostname(host, sizeof host - 1) == 0) {
+        host[sizeof host - 1] = '\0';
+        g_hostname = host;
+    }
     g_initialized = true;
     openSyslogSocket();
 }
 
 void shutdown() {
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_fd >= 0) {
-        ::close(g_fd);
-        g_fd = -1;
-    }
+    closeSyslogSocket();
     g_initialized = false;
 }
 
 bool initialized() { return g_initialized; }
 const Options& options() { return g_options; }
 bool enabled(Level l) { return (int)l <= (int)g_options.level; }
+
+std::string redact(const std::string& secret) {
+    if (secret.empty()) return "<empty>";
+    return "***(" + std::to_string(secret.size()) + " bytes)";
+}
+
+std::string clip(const std::string& s, size_t max) {
+    if (s.size() <= max) return s;
+    return s.substr(0, max) + "...(" + std::to_string(s.size()) + " bytes)";
+}
 
 static std::string escapeSd(const std::string& s) {
     std::string out;
@@ -114,46 +140,57 @@ static std::string escapeSd(const std::string& s) {
     return out;
 }
 
+static std::string baseName(const std::string& path) {
+    size_t slash = path.find_last_of('/');
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+// Upper bound for one datagram; larger messages are truncated.
+static constexpr size_t kMaxMessage = 16 * 1024;
+
 void write(Level l, const std::string& message, std::initializer_list<std::pair<std::string, std::string>> sd) {
     if (!g_initialized || !enabled(l)) return;
 
-    char host[256] = "localhost";
-    ::gethostname(host, sizeof host - 1);
-
-    auto nowT = std::time(nullptr);
+    struct timespec ts{};
+    ::clock_gettime(CLOCK_REALTIME, &ts);
     std::tm tm{};
-    gmtime_r(&nowT, &tm);
-    char stamp[40];
-    std::strftime(stamp, sizeof stamp, "%Y-%m-%dT%H:%M:%S.000Z", &tm);
+    gmtime_r(&ts.tv_sec, &tm);
+    char stamp[48];
+    size_t n = std::strftime(stamp, sizeof stamp, "%Y-%m-%dT%H:%M:%S", &tm);
+    std::snprintf(stamp + n, sizeof stamp - n, ".%06ldZ", ts.tv_nsec / 1000);
 
     std::string sdStr;
+    std::string file, line;
     for (const auto& [k, v] : sd) {
-        if (k == "file" && sd.size() == 2) continue; // handled below together with line
-        sdStr += "[" + k + "=\"" + escapeSd(v) + "\"]";
+        if (k == "file") file = baseName(v);
+        else if (k == "line") line = v;
+        else sdStr += "[" + k + "=\"" + escapeSd(v) + "\"]";
     }
-    if (sd.size() == 2) {
-        // file/line pair emitted in a stable order
-        std::string file, line;
-        for (const auto& [k, v] : sd) {
-            if (k == "file") file = v;
-            if (k == "line") line = v;
-        }
-        sdStr = "[s3mm@3247 file=\"" + escapeSd(file) + "\" line=\"" + escapeSd(line) + "\"]";
-    }
+    if (!file.empty())
+        sdStr = "[s3mm@3247 file=\"" + escapeSd(file) + "\" line=\"" + escapeSd(line) + "\"]" + sdStr;
     if (sdStr.empty()) sdStr = "-";
 
-    std::string msg = "<" + std::to_string(facilityNumber(g_options.facility) + (int)l) + ">1 " + stamp + " " + host +
-                      " " + g_options.ident + " - - " + sdStr + " " + message;
+    // One record per line: fold embedded newlines.
+    std::string body = message.size() > kMaxMessage ? clip(message, kMaxMessage) : message;
+    for (char& c : body)
+        if (c == '\n' || c == '\r') c = ' ';
 
-    bool sent = false;
-    if (openSyslogSocket()) {
-        ssize_t n = ::send(g_fd, msg.data(), msg.size(), MSG_NOSIGNAL);
-        sent = n == (ssize_t)msg.size();
-    }
-    if (!sent && g_options.toStderr) {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        std::fprintf(stderr, "%s\n", msg.c_str());
-        std::fflush(stderr);
+    std::lock_guard<std::mutex> lock(g_mutex);
+    std::string msg = "<" + std::to_string(facilityNumber(g_options.facility) + (int)l) + ">1 " + stamp + " " +
+                      g_hostname + " " + g_options.ident + " " + std::to_string(::getpid()) + " - " + sdStr + " " +
+                      body;
+
+    // Second attempt reconnects: syslog may have been restarted under us.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (!openSyslogSocket()) continue;
+        ssize_t sent = ::send(g_fd, msg.data(), msg.size(), MSG_NOSIGNAL);
+        if (sent == (ssize_t)msg.size()) return;
+        int err = errno;
+        if (err == EMSGSIZE && msg.size() > 2048) {
+            msg = clip(msg, 2048);
+            continue;
+        }
+        closeSyslogSocket();
     }
 }
 

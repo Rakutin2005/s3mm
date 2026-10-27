@@ -38,7 +38,7 @@ struct WsClusterSettings {
 };
 
 struct Options {
-    std::string config = "/etc/s3mm/s3mm.conf";
+    std::string config = "/etc/s3mm/s3mmws.conf";
     std::string socket;
     std::string listen = "127.0.0.1";
     int port = 8080;

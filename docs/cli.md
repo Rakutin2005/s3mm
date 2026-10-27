@@ -8,7 +8,7 @@ writing directly to the configuration files (with a warning on stderr).
 
 | Option | Meaning |
 |---|---|
-| `-c, --config <file>` | configuration file (default `/etc/s3mm/s3mm.conf`) |
+| `-c, --config <file>` | configuration file (default `/etc/s3mm/s3mmd.conf`) |
 | `-s, --socket <path>` | control socket (`$S3MM_SOCKET`, then the config `socket`, then `/run/s3mm/s3mm.sock`) |
 | `-o, --output <fmt>` | `table` (default), `json`, `yaml` |
 | `--permanent` | write changes back to the configuration files |
@@ -40,6 +40,27 @@ Exit codes: `0` success, `1` error, `2` usage error.
   destination-only accounts. Scheduled replication account sync never prunes.
 - `rescan [replica]`, `reset-stats [replica]`, `reload`
 - `validate`, `flush-config`
+- `check [cluster]` — availability of the clusters: every `addr` gets a
+  ListBuckets with the cluster credential (OK / AUTH/ERROR / DOWN), every
+  `admin_endpoint` of a managed cluster is checked for an HTTP answer. Asks
+  s3mmd; when it is not running the check runs locally from the configuration.
+  Exit status 1 when a cluster has no working data endpoint.
+
+## S3 client
+
+`s3mm s3 ...` talks to a cluster of the configuration directly (endpoints and
+credentials are read from the config file, s3mmd is not needed):
+
+| Command | |
+|---|---|
+| `s3 info <cluster> [--no-count]` | availability, buckets, object counts and sizes |
+| `s3 ls <cluster>` | buckets |
+| `s3 ls <cluster> <bucket>[/<prefix>] [-r] [--limit N]` | objects (`-r`: recursive) |
+| `s3 stat <cluster> <bucket>/<key>` | object metadata |
+| `s3 get <cluster> <bucket>/<key> [<file>\|-]` | download (default `./<basename>`, `-` = stdout) |
+| `s3 put <cluster> <file> <bucket>[/<key>] [--content-type T]` | upload (multipart above `part_size`) |
+| `s3 rm <cluster> <bucket>/<key>` | delete an object |
+| `s3 mb <cluster> <bucket>` / `s3 rb <cluster> <bucket> [--force]` | create / delete a bucket (`--force` empties it first) |
 
 ## Rule syntax
 

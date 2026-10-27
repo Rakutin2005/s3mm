@@ -1,5 +1,6 @@
 #include "s3mm/replication/basket.hpp"
 
+#include "s3mm/common/log.hpp"
 #include "s3mm/common/str.hpp"
 
 namespace s3mm::repl {
@@ -36,6 +37,7 @@ Task::Task(std::string replication, std::string source, std::string destination,
       cycle_(cycle),
       started_(tm::now()) {
     id_ = replication_ + "/" + bucket_ + "#" + std::to_string(cycle);
+    LOG_DEBUG("task ", id_, " created (", source_, " -> ", destination_, ")");
 }
 
 void Task::add(Candidate candidate) {
@@ -43,6 +45,9 @@ void Task::add(Candidate candidate) {
     Basket& b = baskets_[outcome];
     if (b.outcome.empty()) b.outcome = outcome;
     if (b.targetName.empty()) b.targetName = candidate.target;
+    LOG_DEBUG("task ", id_, ": ", candidate.bucket, "/", candidate.key, " (", candidate.size, " bytes) added to ",
+              outcome, " basket -> ", b.targetName.empty() ? std::string("null") : b.targetName, " (",
+              b.items.size() + 1, " item(s))");
     b.items.push_back(std::move(candidate));
 }
 

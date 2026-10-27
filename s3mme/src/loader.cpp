@@ -11,26 +11,37 @@ namespace s3mme {
 
 BrokerLoader::~BrokerLoader() {
     for (auto& [handle, broker] : loaded_) {
+        LOG_DEBUG("unloading broker module ", broker && broker->name() ? broker->name() : "?");
         delete broker;
         if (handle) dlclose(handle);
     }
 }
 
 Result<void> BrokerLoader::loadFile(const std::string& path) {
+    LOG_DEBUG("dlopen ", path);
     void* handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
-    if (!handle) return Result<void>::failure("cannot load broker module " + path + ": " + dlerror());
+    if (!handle) {
+        std::string why = dlerror();
+        LOG_ERROR("dlopen ", path, " failed: ", why);
+        return Result<void>::failure("cannot load broker module " + path + ": " + why);
+    }
+    LOG_DEBUG("dlopen ", path, " ok, resolving s3mme_broker_entry");
     auto entry = reinterpret_cast<CreateBrokerFn>(dlsym(handle, "s3mme_broker_entry"));
     if (!entry) {
+        const char* why = dlerror();
+        LOG_ERROR("module ", path, " has no s3mme_broker_entry() symbol: ", why ? why : "(null)");
         dlclose(handle);
         return Result<void>::failure("module " + path + " has no s3mme_broker_entry() symbol");
     }
     IBroker* broker = entry();
     if (!broker) {
+        LOG_ERROR("module ", path, ": s3mme_broker_entry() returned null");
         dlclose(handle);
         return Result<void>::failure("module " + path + " returned null");
     }
     std::string name = broker->name() ? broker->name() : "unknown";
     if (byName_.count(name)) {
+        LOG_WARN("broker '", name, "' from ", path, " already loaded, skipping duplicate");
         delete broker;
         dlclose(handle);
         return Result<void>::failure("broker '" + name + "' already loaded (" + path + ")");
@@ -42,10 +53,13 @@ Result<void> BrokerLoader::loadFile(const std::string& path) {
 }
 
 Result<void> BrokerLoader::loadDir(const std::string& dir) {
+    LOG_DEBUG("scanning broker module dir ", dir);
     std::string lastError;
     bool any = false;
+    size_t candidates = 0;
     for (const auto& entry : s3mm::fs::listDir(dir)) {
         if (!s3mm::str::endsWith(entry, ".so")) continue;
+        ++candidates;
         auto res = loadFile(s3mm::fs::joinPath(dir, entry));
         if (!res) {
             lastError = res.error();
@@ -54,6 +68,7 @@ Result<void> BrokerLoader::loadDir(const std::string& dir) {
         }
         any = true;
     }
+    LOG_DEBUG("module dir ", dir, ": ", candidates, " candidate(s), ", any ? "some" : "none", " loaded");
     if (!any && !lastError.empty()) return Result<void>::failure(lastError);
     return Result<void>::success();
 }
@@ -67,11 +82,13 @@ Result<void> BrokerLoader::loadDefaults() {
     std::string lastError;
     bool any = false;
     for (const auto& d : dirs) {
-        if (!s3mm::fs::exists(d)) continue;
+        if (!s3mm::fs::exists(d)) { LOG_DEBUG("module search path ", d, " does not exist, skipped"); continue; }
+        LOG_DEBUG("module search path ", d);
         auto res = loadDir(d);
         if (res) any = true;
         else lastError = res.error();
     }
+    if (byName_.empty()) LOG_WARN("no broker modules found in default search paths");
     if (!any && !lastError.empty()) return Result<void>::failure(lastError);
     return Result<void>::success();
 }

@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/s3mmd -c /etc/s3mm/s3mm.conf
+ExecStart=/usr/bin/s3mmd -c /etc/s3mm/s3mmd.conf
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5

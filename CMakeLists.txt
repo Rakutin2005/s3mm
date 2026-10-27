@@ -52,6 +52,7 @@ add_library(s3mm_core STATIC
   src/replication/basket.cpp
   src/replication/stat.cpp
   src/replication/access.cpp
+  src/replication/probe.cpp
   src/replication/engine.cpp
 )
 target_link_libraries(s3mm_core PUBLIC
@@ -72,6 +73,7 @@ add_executable(s3mm
   src/cli/main.cpp
   src/cli/commands.cpp
   src/cli/render.cpp
+  src/cli/s3cmd.cpp
   src/cli/client.cpp
 )
 target_link_libraries(s3mm PRIVATE s3mm_core)
@@ -116,6 +118,10 @@ add_executable(s3mmws
   src/cli/client.cpp
 )
 target_link_libraries(s3mmws PRIVATE s3mm_core ${ARGON2_LIBRARY} ldap lber)
+
+# Modules are dlopen()ed and carry their own static copy of s3mm_core; exporting
+# the host's symbols makes them bind to the host's (initialized) syslog logger.
+set_target_properties(s3mmd s3mmws s3mme s3mmc PROPERTIES ENABLE_EXPORTS ON)
 
 # -------------------------------------------------------------------- modules
 function(s3mm_module name)
@@ -171,18 +177,19 @@ target_link_libraries(s3mm_e2e PRIVATE s3mm_core)
 add_test(NAME e2e COMMAND s3mm_e2e)
 
 # ------------------------------------------------------------------- install
-install(TARGETS s3mmd s3mm s3mmws s3mme RUNTIME DESTINATION bin)
+install(TARGETS s3mmd s3mm s3mmws s3mme s3mmc RUNTIME DESTINATION /usr/bin)
 
 # Configuration (exclude secrets)
-install(DIRECTORY etc/s3mm/ DESTINATION etc/s3mm
+install(DIRECTORY etc/s3mm/ DESTINATION /etc/s3mm
         FILES_MATCHING PATTERN "*.conf")
-install(FILES systemd/s3mmd.service DESTINATION lib/systemd/system)
+install(FILES systemd/s3mmd.service systemd/s3mmws.service systemd/s3mmc.service systemd/s3mme.service
+        DESTINATION /usr/lib/systemd/system)
 
 # Ensure cache/runtime dirs exist
-install(DIRECTORY DESTINATION var/cache/s3mm)
-install(DIRECTORY DESTINATION run/s3mm)
+install(DIRECTORY DESTINATION /var/cache/s3mm)
+install(DIRECTORY DESTINATION /run/s3mm)
 
-install(DIRECTORY ${CMAKE_BINARY_DIR}/modules/ DESTINATION lib/s3mm/modules FILES_MATCHING PATTERN "*.so")
+install(DIRECTORY ${CMAKE_BINARY_DIR}/modules/ DESTINATION /usr/lib/s3mm/modules FILES_MATCHING PATTERN "*.so")
 
 
 # ---------------------------------------------------------------- packaging (rpm/deb)
@@ -191,12 +198,12 @@ set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
 set(CPACK_PACKAGE_VENDOR "s3mm")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "S3 replication daemon, CLI, REST and cluster client")
 set(CPACK_PACKAGE_CONTACT "s3mm maintainers")
-set(CPACK_PACKAGING_INSTALL_PREFIX "/usr")
+set(CPACK_PACKAGING_INSTALL_PREFIX "/")
 set(CPACK_GENERATOR "RPM;DEB")
 
 set(CPACK_RPM_PACKAGE_LICENSE "Apache-2.0")
 set(CPACK_RPM_PACKAGE_GROUP "System Environment/Daemons")
-set(CPACK_RPM_PACKAGE_REQUIRES "libcurl >= 8.0, openssl-libs >= 3.0, argon2, zlib, openldap, systemd")
+set(CPACK_RPM_PACKAGE_REQUIRES "libcurl, openssl-libs, libargon2, zlib, openldap, openldap-clients, systemd")
 set(CPACK_RPM_FILE_NAME "RPM-DEFAULT")
 set(CPACK_RPM_POST_INSTALL_SCRIPT_FILE "${CMAKE_SOURCE_DIR}/packaging/postinst")
 

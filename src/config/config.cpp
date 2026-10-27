@@ -7,6 +7,7 @@
 #include "s3mm/common/str.hpp"
 #include "s3mm/common/glob.hpp"
 #include "s3mm/common/fs.hpp"
+#include "s3mm/common/log.hpp"
 
 namespace s3mm::config {
 
@@ -226,6 +227,8 @@ struct Parser {
                 parseBody(node.children, false);
                 if (cur.kind != Tok::RBrace) throw ConfigError("'}' expected", lex.file, cur.line);
                 advance();
+                LOG_DEBUG("config: parsed block '", node.name, node.args.empty() ? "" : " ", node.argOr(0), "' at ",
+                          node.file, ":", node.line, " (", node.children.size(), " child node(s))");
                 out.push_back(std::move(node));
                 continue;
             }
@@ -240,22 +243,36 @@ struct Parser {
             pattern = fs::joinPath(base.empty() ? "." : base, pattern);
         }
         auto files = glob::expand(pattern);
+        LOG_DEBUG("config: include '", includeNode.args[0], "' at ", includeNode.file, ":", includeNode.line,
+                  " -> pattern ", pattern, " matched ", files.size(), " file(s)",
+                  files.empty() ? "" : ": ", str::join(files, ", "));
         if (files.empty()) {
             // allow including an explicitly named missing file to fail loudly
-            if (pattern.find('*') == std::string::npos)
+            if (pattern.find('*') == std::string::npos) {
+                LOG_ERROR("config: include: cannot open '", pattern, "' (", includeNode.file, ":", includeNode.line, ")");
                 throw ConfigError("include: cannot open '" + pattern + "'", includeNode.file, includeNode.line);
+            }
+            LOG_DEBUG("config: include pattern ", pattern, " matched nothing, skipped");
             return;
         }
         for (const auto& f : files) {
             std::error_code ec;
             std::string real = std::filesystem::weakly_canonical(f, ec).string();
-            if (!includeStack->insert(real).second)
+            if (!includeStack->insert(real).second) {
+                LOG_ERROR("config: include cycle detected on '", f, "' (", includeNode.file, ":", includeNode.line, ")");
                 throw ConfigError("include cycle detected on '" + f + "'", includeNode.file, includeNode.line);
+            }
             auto content = s3mm::fs::readFile(f);
-            if (!content) throw ConfigError("include: cannot read '" + f + "'", includeNode.file, includeNode.line);
+            if (!content) {
+                LOG_ERROR("config: include: cannot read '", f, "' (", includeNode.file, ":", includeNode.line, ")");
+                throw ConfigError("include: cannot read '" + f + "'", includeNode.file, includeNode.line);
+            }
+            LOG_DEBUG("config: including ", f, " (", content->size(), " bytes)");
+            size_t before = out.size();
             Parser sub(*content, f, includeStack);
             sub.parseBody(out, true);
             includeStack->erase(real);
+            LOG_DEBUG("config: included ", f, ": ", out.size() - before, " top-level node(s)");
         }
     }
 };
@@ -266,10 +283,13 @@ Result<Config> Config::parse(const std::string& text, const std::string& filenam
     Config cfg;
     cfg.path_ = filename;
     std::set<std::string> stack;
+    log::Stopwatch sw;
+    LOG_DEBUG("config: parsing ", filename, " (", text.size(), " bytes)");
     try {
         Parser p(text, filename, &stack);
         p.parseBody(cfg.roots_, true);
     } catch (const Error& e) {
+        LOG_ERROR("config: parse error in ", filename, ": ", e.what());
         return Result<Config>::failure(e.what());
     }
     for (const auto& r : cfg.roots_)
@@ -278,6 +298,8 @@ Result<Config> Config::parse(const std::string& text, const std::string& filenam
     // wrap all top-level nodes into an implicit s3mm block so the rest of
     // the system (and s3mmc/s3mme) keeps working unchanged.
     if (!cfg.s3mm_ && !cfg.roots_.empty()) {
+        LOG_DEBUG("config: ", filename, " has no 's3mm { ... }' wrapper, wrapping ", cfg.roots_.size(),
+                  " top-level node(s) into an implicit block");
         config::Node wrapper;
         wrapper.name = "s3mm";
         wrapper.block = true;
@@ -288,13 +310,21 @@ Result<Config> Config::parse(const std::string& text, const std::string& filenam
         cfg.roots_.push_back(std::move(wrapper));
         cfg.s3mm_ = &cfg.roots_.back();
     }
+    LOG_DEBUG("config: parsed ", filename, ": ", cfg.s3mm_ ? cfg.s3mm_->children.size() : 0,
+              " directive(s) in the s3mm block, ", sw.ms(), " ms");
     return Result<Config>(std::move(cfg));
 }
 
 Result<Config> Config::load(const std::string& path) {
+    LOG_DEBUG("config: opening ", path);
     auto content = s3mm::fs::readFile(path);
-    if (!content) return Result<Config>::failure("cannot read config file: " + path);
-    return parse(*content, path);
+    if (!content) {
+        LOG_ERROR("config: cannot read config file ", path);
+        return Result<Config>::failure("cannot read config file: " + path);
+    }
+    auto res = parse(*content, path);
+    if (res) LOG_INFO("config: loaded ", path, " (", content->size(), " bytes)");
+    return res;
 }
 
 // -------------------------------------------------------------- validation --
@@ -337,7 +367,10 @@ std::vector<std::string> Config::validate() const {
     if (s3mmBlocks > 1)
         errors.push_back(path_ + ": multiple top-level 's3mm { ... }' blocks are not supported");
     if (!s3mm_) {
-        errors.push_back(path_ + ": missing top-level 's3mm { ... }' block");
+        // parse() wraps any wrapper-less content into an implicit s3mm block,
+        // so no block here means the configuration has no directives at all.
+        LOG_WARN("config: ", path_.empty() ? std::string("<memory>") : path_,
+                 " contains no directives (empty or includes matched nothing), defaults apply");
         return errors;
     }
     for (const char* kind : {"cluster", "credential", "policy", "replication", "target", "user"})
@@ -347,6 +380,7 @@ std::vector<std::string> Config::validate() const {
         if (!sk->args.empty()) {
             const std::string& sp = sk->args[0];
             if (sp.find("://") != std::string::npos || (sp.find(':') != std::string::npos && sp.find('/') == std::string::npos)) {
+                LOG_DEBUG("config: control socket '", sp, "' is not a UNIX socket path");
                 errors.push_back(sk->file + ":" + std::to_string(sk->line) + ": s3mmd control socket must be a UNIX domain socket path, not a network address");
             }
         }
@@ -386,6 +420,8 @@ std::vector<std::string> Config::validate() const {
         if (!n->find("source")) errors.push_back(n->file + ":" + std::to_string(n->line) + ": replication '" + n->argOr(0) + "' has no source");
         if (!n->find("destination")) errors.push_back(n->file + ":" + std::to_string(n->line) + ": replication '" + n->argOr(0) + "' has no destination");
     }
+    for (const auto& e : errors) LOG_WARN("config: validation: ", e);
+    LOG_DEBUG("config: validated ", path_, ": ", errors.size(), " problem(s)");
     return errors;
 }
 

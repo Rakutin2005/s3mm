@@ -67,23 +67,34 @@ AccountSync::AccountSync(const registry::Registry& registry, module::Loader& loa
 
 bool AccountSync::selected(const registry::Replication& replication, const std::string& accessKey) {
     if (replication.accounts.empty()) return true;
-    return glob::matchFilter(replication.accounts, accessKey);
+    bool match = glob::matchFilter(replication.accounts, accessKey);
+    if (!match) LOG_DEBUG("replication '", replication.name, "': account ", accessKey, " outside the account filter");
+    return match;
 }
 
 Result<std::unique_ptr<module::IAdminProvider>> AccountSync::adminFor(const registry::Cluster& cluster) const {
+    if (!cluster.managed) {
+        LOG_DEBUG("admin for cluster '", cluster.name, "': cluster is unmanaged (managed off), admin API not used");
+        return Result<std::unique_ptr<module::IAdminProvider>>::failure(
+            "cluster '" + cluster.name + "' is not managed (managed off)");
+    }
     module::IModule* mod = loader_.find(cluster.vendor);
     if (!mod) {
         const auto names = loader_.names();
+        LOG_DEBUG("admin for cluster '", cluster.name, "': no module '", cluster.vendor, "' loaded (available: ",
+                  str::join(names, ", "), ")");
         return Result<std::unique_ptr<module::IAdminProvider>>::failure(
             "cluster '" + cluster.name + "': no module '" + cluster.vendor + "' loaded (available: " +
             str::join(names, ", ") + ")");
     }
     const registry::Credential* cred = registry_.bestCredential(cluster);
-    if (!cred)
+    if (!cred) {
+        LOG_WARN("admin for cluster '", cluster.name, "': no usable credential");
         return Result<std::unique_ptr<module::IAdminProvider>>::failure("cluster '" + cluster.name + "': no usable credential");
+    }
 
     s3::ClientOptions options;
-    options.endpoints = cluster.endpoints;
+    options.endpoints = cluster.adminEndpoints.empty() ? cluster.endpoints : cluster.adminEndpoints;
     options.pathStyle = cluster.pathStyle;
     options.insecure = cluster.insecure;
     options.timeoutSec = cluster.timeoutSec;
@@ -91,13 +102,22 @@ Result<std::unique_ptr<module::IAdminProvider>> AccountSync::adminFor(const regi
     options.rateLimitPerSec = cluster.rateLimitPerSec;
     options.maxRetries = cluster.retries;
     mod->adjustClientOptions(options);
+    LOG_DEBUG("admin for cluster '", cluster.name, "': management endpoint(s) ", str::join(options.endpoints, ","),
+              cluster.adminEndpoints.empty() ? " (same as data endpoints)" : " (admin_endpoint)");
 
     sigv4::Credentials sig{cred->accessKey, cred->secretKey, cred->sessionToken, cred->region};
+    LOG_DEBUG("admin for cluster '", cluster.name, "': module ", cluster.vendor, ", ", options.endpoints.size(),
+              " endpoint(s), access key ", cred->accessKey, ", secret ", log::redact(cred->secretKey));
     auto provider = mod->createAdmin(options, sig);
-    if (!provider) return Result<std::unique_ptr<module::IAdminProvider>>::failure(provider.error());
-    if (!provider.value()->features().credentials)
+    if (!provider) {
+        LOG_ERROR("admin for cluster '", cluster.name, "': module ", cluster.vendor, ": ", provider.error());
+        return Result<std::unique_ptr<module::IAdminProvider>>::failure(provider.error());
+    }
+    if (!provider.value()->features().credentials) {
+        LOG_DEBUG("admin for cluster '", cluster.name, "': module ", cluster.vendor, " has no account admin support");
         return Result<std::unique_ptr<module::IAdminProvider>>::failure(
             "cluster '" + cluster.name + "': module '" + cluster.vendor + "' does not support account admin");
+    }
     return provider;
 }
 
@@ -106,7 +126,11 @@ Result<std::shared_ptr<s3::Client>> AccountSync::clientFor(const registry::Clust
     const registry::Credential* cred = credentialName.empty()
                                            ? registry_.bestCredential(cluster)
                                            : registry_.credentialFor(cluster, credentialName);
-    if (!cred) return Result<std::shared_ptr<s3::Client>>::failure("cluster '" + cluster.name + "': no usable credential");
+    if (!cred) {
+        LOG_ERROR("client for cluster '", cluster.name, "': no usable credential",
+                  credentialName.empty() ? std::string() : " named '" + credentialName + "'");
+        return Result<std::shared_ptr<s3::Client>>::failure("cluster '" + cluster.name + "': no usable credential");
+    }
 
     s3::ClientOptions options;
     options.endpoints = cluster.endpoints;
@@ -118,7 +142,12 @@ Result<std::shared_ptr<s3::Client>> AccountSync::clientFor(const registry::Clust
     options.maxRetries = cluster.retries;
 
     if (module::IModule* mod = loader_.find(cluster.vendor)) mod->adjustClientOptions(options);
+    else LOG_DEBUG("client for cluster '", cluster.name, "': no module '", cluster.vendor, "', using generic options");
 
+    LOG_DEBUG("client for cluster '", cluster.name, "': endpoints ", str::join(options.endpoints, ","), " path-style=",
+              options.pathStyle ? "yes" : "no", " insecure=", options.insecure ? "yes" : "no", " timeout=",
+              options.timeoutSec, "s retries=", options.maxRetries, " access key ", cred->accessKey, " secret ",
+              log::redact(cred->secretKey), cred->sessionToken.empty() ? "" : " (session token set)");
     sigv4::Credentials sig{cred->accessKey, cred->secretKey, cred->sessionToken, cred->region};
     return Result<std::shared_ptr<s3::Client>>(std::make_shared<s3::Client>(options, sig));
 }
@@ -153,8 +182,19 @@ Result<SyncReport> AccountSync::sync(const registry::Replication& replication, b
                                      const std::function<bool(const module::Account&)>& accept) const {
     const registry::Cluster* source = registry_.cluster(replication.source);
     const registry::Cluster* destination = registry_.cluster(replication.destination);
-    if (!source) return Result<SyncReport>::failure("unknown source cluster '" + replication.source + "'");
-    if (!destination) return Result<SyncReport>::failure("unknown destination cluster '" + replication.destination + "'");
+    if (!source) {
+        LOG_ERROR("account sync for replication '", replication.name, "': unknown source cluster '",
+                  replication.source, "'");
+        return Result<SyncReport>::failure("unknown source cluster '" + replication.source + "'");
+    }
+    if (!destination) {
+        LOG_ERROR("account sync for replication '", replication.name, "': unknown destination cluster '",
+                  replication.destination, "'");
+        return Result<SyncReport>::failure("unknown destination cluster '" + replication.destination + "'");
+    }
+    log::Stopwatch sw;
+    LOG_DEBUG("account sync for replication '", replication.name, "': ", replication.source, " -> ",
+              replication.destination, dryRun ? " (dry run)" : "", prune ? " (prune)" : "");
 
     auto sourceAdmin = adminFor(*source);
     if (!sourceAdmin) return Result<SyncReport>::failure(sourceAdmin.error());
@@ -163,9 +203,19 @@ Result<SyncReport> AccountSync::sync(const registry::Replication& replication, b
     const module::FeatureSet destFeatures = destAdmin.value()->features();
 
     auto sourceList = sourceAdmin.value()->listAccounts();
-    if (!sourceList) return Result<SyncReport>::failure(sourceList.error());
+    if (!sourceList) {
+        LOG_ERROR("account sync for replication '", replication.name, "': list accounts on ", replication.source,
+                  ": ", sourceList.error());
+        return Result<SyncReport>::failure(sourceList.error());
+    }
     auto destList = destAdmin.value()->listAccounts();
-    if (!destList) return Result<SyncReport>::failure(destList.error());
+    if (!destList) {
+        LOG_ERROR("account sync for replication '", replication.name, "': list accounts on ", replication.destination,
+                  ": ", destList.error());
+        return Result<SyncReport>::failure(destList.error());
+    }
+    LOG_DEBUG("account sync for replication '", replication.name, "': ", sourceList.value().size(),
+              " source account(s), ", destList.value().size(), " destination account(s)");
 
     SyncReport report;
     report.dryRun = dryRun;
@@ -181,7 +231,8 @@ Result<SyncReport> AccountSync::sync(const registry::Replication& replication, b
         if (dryRun) return true;
         auto res = fn();
         if (!res) {
-            LOG_ERROR("account sync: ", change.accessKey, ": ", res.error());
+            LOG_ERROR("account sync for replication '", replication.name, "': ", change.accessKey, " [",
+                      str::join(change.actions, ", "), "]: ", res.error());
             return false;
         }
         return true;
@@ -189,7 +240,11 @@ Result<SyncReport> AccountSync::sync(const registry::Replication& replication, b
 
     for (auto& src : sourceList.value()) {
         if (!selected(replication, src.accessKey)) continue;
-        if (accept && !accept(src)) continue; // rejected by the access policy
+        if (accept && !accept(src)) { // rejected by the access policy
+            LOG_DEBUG("account sync for replication '", replication.name, "': ", src.accessKey,
+                      " rejected by the access policy");
+            continue;
+        }
         report.sourceAccounts++;
 
         auto destIt = destByKey.find(src.accessKey);
@@ -201,6 +256,8 @@ Result<SyncReport> AccountSync::sync(const registry::Replication& replication, b
             if (!src.buckets.empty()) change.actions.emplace_back("grants");
             for (const auto& p : src.policies) change.actions.push_back("policy+:" + p);
             if (destFeatures.groups && !src.groups.empty()) change.actions.emplace_back("groups");
+            LOG_DEBUG("account sync for replication '", replication.name, "': ", dryRun ? "would create " : "creating ",
+                      src.accessKey, " [", str::join(change.actions, ", "), "]");
 
             bool ok = apply(change, [&] { return destAdmin.value()->createAccount(src); });
             if (ok && !src.buckets.empty() && !dryRun)
@@ -211,7 +268,9 @@ Result<SyncReport> AccountSync::sync(const registry::Replication& replication, b
             if (ok && !dryRun) {
                 for (const auto& p : src.policies) {
                     auto res = destAdmin.value()->attachPolicy(src.accessKey, p);
-                    if (!res) LOG_WARN("account sync: attach policy ", p, " to ", src.accessKey, ": ", res.error());
+                    if (!res)
+                        LOG_WARN("account sync for replication '", replication.name, "': attach policy ", p, " to ",
+                                 src.accessKey, ": ", res.error());
                 }
             }
             change.applied = ok && !dryRun;
@@ -220,6 +279,9 @@ Result<SyncReport> AccountSync::sync(const registry::Replication& replication, b
                 report.failed++;
             } else {
                 report.created++;
+                if (!dryRun)
+                    LOG_INFO("account sync for replication '", replication.name, "': created account ", src.accessKey,
+                             " on ", replication.destination);
             }
             report.changes.push_back(std::move(change));
             destByKey[src.accessKey] = src;
@@ -229,8 +291,11 @@ Result<SyncReport> AccountSync::sync(const registry::Replication& replication, b
         std::vector<std::string> actions = diffAccounts(src, destIt->second, src.hasSecret, destFeatures);
         if (actions.empty()) {
             report.matched++;
+            LOG_DEBUG("account sync for replication '", replication.name, "': ", src.accessKey, " identical");
             continue;
         }
+        LOG_DEBUG("account sync for replication '", replication.name, "': ", dryRun ? "would update " : "updating ",
+                  src.accessKey, " [", str::join(actions, ", "), "]");
         AccountChange change;
         change.accessKey = src.accessKey;
         change.actions = actions;
@@ -259,9 +324,12 @@ Result<SyncReport> AccountSync::sync(const registry::Replication& replication, b
             }
         }
         change.applied = ok && !dryRun;
-        if (ok)
+        if (ok) {
             report.updated++;
-        else {
+            if (!dryRun)
+                LOG_INFO("account sync for replication '", replication.name, "': updated account ", src.accessKey,
+                         " [", str::join(change.actions, ", "), "]");
+        } else {
             change.error = "one or more updates failed";
             report.failed++;
         }
@@ -285,11 +353,16 @@ Result<SyncReport> AccountSync::sync(const registry::Replication& replication, b
             AccountChange change;
             change.accessKey = key;
             change.actions.emplace_back("delete");
+            LOG_DEBUG("account sync for replication '", replication.name, "': ", dryRun ? "would prune " : "pruning ",
+                      key, " (absent on the source)");
             bool ok = apply(change, [&] { return destAdmin.value()->deleteAccount(key); });
             change.applied = ok && !dryRun;
-            if (ok)
+            if (ok) {
                 report.deleted++;
-            else {
+                if (!dryRun)
+                    LOG_INFO("account sync for replication '", replication.name, "': deleted account ", key, " on ",
+                             replication.destination);
+            } else {
                 change.error = "delete failed";
                 report.failed++;
             }
@@ -299,7 +372,9 @@ Result<SyncReport> AccountSync::sync(const registry::Replication& replication, b
 
     LOG_DEBUG("account sync for replication '", replication.name, "': created=", report.created,
               " updated=", report.updated, " deleted=", report.deleted, " matched=", report.matched,
-              " failed=", report.failed, dryRun ? " (dry run)" : "");
+              " failed=", report.failed, dryRun ? " (dry run)" : "", " in ", sw.ms(), " ms");
+    if (report.failed > 0)
+        LOG_WARN("account sync for replication '", replication.name, "': ", report.failed, " change(s) failed");
     return Result<SyncReport>(std::move(report));
 }
 

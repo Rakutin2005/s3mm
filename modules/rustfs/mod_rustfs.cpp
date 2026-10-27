@@ -130,19 +130,30 @@ public:
         http::Response exported = call("GET", "/export-iam");
         if (exported.ok() && exported.body.size() >= 2 && exported.body.compare(0, 2, "PK") == 0) {
             auto accounts = parseIamExport(exported.body, "rustfs");
-            if (accounts) return accounts;
+            if (accounts) {
+                LOG_DEBUG("rustfs listAccounts: ", accounts.value().size(), " account(s) from export-iam");
+                return accounts;
+            }
             LOG_WARN(accounts.error());
         } else if (exported.ok()) {
             LOG_WARN("rustfs export-iam: unexpected response (not a ZIP)");
+        } else {
+            LOG_WARN(fail("export-iam", exported), "; falling back to list-users (no secrets)");
         }
 
         http::Response r = call("GET", "/list-users");
-        if (!r.ok()) return Result<std::vector<Account>>::failure(fail("list-users", r));
+        if (!r.ok()) {
+            std::string err = fail("list-users", r);
+            LOG_ERROR(err);
+            return Result<std::vector<Account>>::failure(err);
+        }
         std::string err;
         Value root = Value::parseJson(r.body, &err);
-        if (!err.empty())
+        if (!err.empty()) {
+            LOG_ERROR("rustfs list-users: unparseable response: ", err, "; body: ", log::clip(r.body, 200));
             return Result<std::vector<Account>>::failure(
                 "rustfs list-users: unparseable response: " + err);
+        }
         std::vector<Account> out;
         if (root.isObject()) {
             bool consumed = false;
@@ -155,22 +166,29 @@ public:
                     consumed = true;
                 }
             }
-            if (consumed) return Result<std::vector<Account>>(std::move(out));
+            if (consumed) {
+                LOG_DEBUG("rustfs listAccounts: ", out.size(), " account(s) from list-users (keyed map)");
+                return Result<std::vector<Account>>(std::move(out));
+            }
             for (const char* field : {"accounts", "users", "data", "items", "result"}) {
                 if (const Value* arr = root.find(field); arr && arr->isArray()) {
                     for (const auto& it : arr->items())
                         if (it.isObject()) out.push_back(parseAccount(it, ""));
+                    LOG_DEBUG("rustfs listAccounts: ", out.size(), " account(s) from list-users field '", field, "'");
                     return Result<std::vector<Account>>(std::move(out));
                 }
             }
             // empty result (e.g. `{}`) is valid: no users
+            LOG_DEBUG("rustfs listAccounts: no users");
             return Result<std::vector<Account>>(std::move(out));
         }
         if (root.isArray()) {
             for (const auto& it : root.items())
                 if (it.isObject()) out.push_back(parseAccount(it, ""));
+            LOG_DEBUG("rustfs listAccounts: ", out.size(), " account(s) from list-users (array)");
             return Result<std::vector<Account>>(std::move(out));
         }
+        LOG_ERROR("rustfs list-users: unexpected response shape: ", log::clip(r.body, 200));
         return Result<std::vector<Account>>::failure(
             "rustfs list-users: unexpected response shape");
     }
@@ -180,12 +198,17 @@ public:
         if (!all) return Result<Account>::failure(all.error());
         for (auto& a : all.value())
             if (a.accessKey == accessKey) return Result<Account>(std::move(a));
+        LOG_DEBUG("rustfs getAccount: no account '", accessKey, "'");
         return Result<Account>::failure("rustfs: no account '" + accessKey + "'");
     }
 
     Result<void> createAccount(const Account& account) override {
-        if (account.accessKey.empty())
+        if (account.accessKey.empty()) {
+            LOG_ERROR("rustfs createAccount: empty access key");
             return Result<void>::failure("rustfs createAccount: empty access key");
+        }
+        LOG_DEBUG("rustfs createAccount ", account.accessKey, " status=", account.status, " policies=", account.policies.size(),
+                  " buckets=", account.buckets.size(), account.secretKey.empty() ? " (generated secret)" : "");
         std::string secret = account.secretKey.empty() ? randomSecret() : account.secretKey;
         Result<void> res = putUser(account.accessKey, secret, account.status);
         if (!res) return res;
@@ -196,14 +219,23 @@ public:
             body.set("policies", arr);
             body.set("user", Value::str(account.accessKey));
             http::Response r = call("POST", "/idp/builtin/policy/attach", {}, body.toJson(0));
-            if (!r.ok()) return Result<void>::failure(fail("attach", r));
+            if (!r.ok()) {
+                std::string err = fail("attach", r);
+                LOG_ERROR(err);
+                return Result<void>::failure(err);
+            }
         }
+        LOG_INFO("rustfs: account ", account.accessKey, " created");
         if (!account.buckets.empty()) return setBucketAccess(account.accessKey, account.buckets);
         return Result<void>::success();
     }
 
     Result<void> setSecret(const std::string& accessKey, const std::string& secretKey) override {
-        if (secretKey.empty()) return Result<void>::failure("rustfs setSecret: empty secret");
+        if (secretKey.empty()) {
+            LOG_ERROR("rustfs setSecret ", accessKey, ": empty secret");
+            return Result<void>::failure("rustfs setSecret: empty secret");
+        }
+        LOG_INFO("rustfs: rotating secret of ", accessKey, " (new secret ", log::redact(secretKey), ")");
         std::string status = "enabled";
         std::vector<std::string> policies;
         if (auto cur = getAccount(accessKey)) {
@@ -214,28 +246,41 @@ public:
         if (!res) return res;
         // re-attach policies: putUser may have replaced the binding
         if (!policies.empty()) {
+            LOG_DEBUG("rustfs setSecret ", accessKey, ": re-attaching ", policies.size(), " policy(ies)");
             Value body = Value::object();
             Value arr = Value::array();
             for (const auto& p : policies) arr.push(Value::str(p));
             body.set("policies", arr);
             body.set("user", Value::str(accessKey));
             http::Response r = call("POST", "/idp/builtin/policy/attach", {}, body.toJson(0));
-            if (!r.ok()) return Result<void>::failure(fail("attach", r));
+            if (!r.ok()) {
+                std::string err = fail("attach", r);
+                LOG_ERROR(err);
+                return Result<void>::failure(err);
+            }
         }
         return Result<void>::success();
     }
 
     Result<void> setStatus(const std::string& accessKey, const std::string& status) override {
-        if (status != "enabled" && status != "disabled")
+        LOG_INFO("rustfs: setStatus ", accessKey, " -> ", status);
+        if (status != "enabled" && status != "disabled") {
+            LOG_ERROR("rustfs setStatus: expected enabled|disabled, got '", status, "'");
             return Result<void>::failure("rustfs setStatus: expected enabled|disabled, got '" + status + "'");
+        }
         const std::string st = status == "disabled" ? "disabled" : "enabled";
         http::Response r = call("PUT", "/set-user-status", {{"accessKey", accessKey}, {"status", st}});
-        if (!r.ok()) return Result<void>::failure(fail("set-user-status", r));
+        if (!r.ok()) {
+            std::string err = fail("set-user-status", r);
+            LOG_ERROR(err);
+            return Result<void>::failure(err);
+        }
         return Result<void>::success();
     }
 
     Result<void> setBucketAccess(const std::string& accessKey,
                                   const std::map<std::string, std::string>& buckets) override {
+        LOG_INFO("rustfs: setBucketAccess ", accessKey, " -> ", buckets.size(), " bucket(s)");
         if (buckets.empty()) return dropGrants(accessKey);
         Value doc = Value::object();
         doc.set("Version", Value::str("2012-10-17"));
@@ -248,6 +293,7 @@ public:
 
     Result<void> addBucketAccess(const std::string& accessKey, const std::string& bucket,
                                   const std::string& permissions) override {
+        LOG_INFO("rustfs: addBucketAccess ", accessKey, " bucket=", bucket, " permissions=", permissions);
         Value doc = readGrants(accessKey);
         if (!doc.isObject()) doc = emptyPolicy();
         setStatement(doc, bucket, &permissions);
@@ -256,8 +302,12 @@ public:
 
     Result<void> removeBucketAccess(const std::string& accessKey,
                                     const std::string& bucket) override {
+        LOG_INFO("rustfs: removeBucketAccess ", accessKey, " bucket=", bucket);
         Value doc = readGrants(accessKey);
-        if (!doc.isObject()) return Result<void>::success();
+        if (!doc.isObject()) {
+            LOG_DEBUG("rustfs removeBucketAccess ", accessKey, ": no grant policy, nothing to remove");
+            return Result<void>::success();
+        }
         setStatement(doc, bucket, nullptr);
         const Value* stmts = doc.find("Statement");
         if (!stmts || stmts->items().empty()) return dropGrants(accessKey);
@@ -266,9 +316,14 @@ public:
 
     Result<void> attachPolicy(const std::string& accessKey,
                               const std::string& policyName) override {
+        LOG_INFO("rustfs: attach policy ", policyName, " to ", accessKey);
         http::Response r = call("PUT", "/set-user-or-group-policy",
                                 {{"policyName", policyName}, {"userOrGroup", accessKey}, {"isGroup", "false"}});
-        if (!r.ok()) return Result<void>::failure(fail("set-user-or-group-policy", r));
+        if (!r.ok()) {
+            std::string err = fail("set-user-or-group-policy", r);
+            LOG_ERROR(err);
+            return Result<void>::failure(err);
+        }
         return Result<void>::success();
     }
 
@@ -279,8 +334,13 @@ public:
         arr.push(Value::str(policyName));
         body.set("policies", std::move(arr));
         body.set("user", Value::str(accessKey));
+        LOG_INFO("rustfs: detach policy ", policyName, " from ", accessKey);
         http::Response r = call("POST", "/idp/builtin/policy/detach", {}, body.toJson(0));
-        if (!r.ok() && r.status != 404) return Result<void>::failure(fail("detach-policy", r));
+        if (!r.ok() && r.status != 404) {
+            std::string err = fail("detach-policy", r);
+            LOG_ERROR(err);
+            return Result<void>::failure(err);
+        }
         return Result<void>::success();
     }
 
@@ -288,6 +348,7 @@ public:
                            const std::vector<std::string>& current) override {
         std::set<std::string> want(desired.begin(), desired.end());
         std::set<std::string> have(current.begin(), current.end());
+        LOG_DEBUG("rustfs setGroups ", accessKey, ": desired=", desired.size(), " current=", current.size());
         for (const auto& group : have) {
             if (want.count(group)) continue;
             auto res = updateGroup(group, accessKey, true);
@@ -302,9 +363,15 @@ public:
     }
 
     Result<void> deleteAccount(const std::string& accessKey) override {
+        LOG_INFO("rustfs: deleting account ", accessKey);
         http::Response r = call("DELETE", "/remove-user", {{"accessKey", accessKey}});
-        if (!r.ok()) return Result<void>::failure(fail("remove-user", r));
+        if (!r.ok()) {
+            std::string err = fail("remove-user", r);
+            LOG_ERROR(err);
+            return Result<void>::failure(err);
+        }
         dropGrants(accessKey);
+        LOG_INFO("rustfs: account ", accessKey, " deleted");
         return Result<void>::success();
     }
 
@@ -319,7 +386,14 @@ private:
         req.body = body;
         req.timeoutSec = client_.options().timeoutSec;
         req.connectTimeoutSec = client_.options().connectTimeoutSec;
-        return client_.raw(req);
+        std::string q;
+        for (const auto& [k, v] : query) q += (q.empty() ? "?" : "&") + k + "=" + v;
+        LOG_DEBUG("rustfs admin: ", method, " ", path, q, " body=", body.size(), "B");
+        log::Stopwatch sw;
+        http::Response r = client_.raw(req);
+        LOG_DEBUG("rustfs admin: ", method, " ", path, " -> ", r.ok() ? std::to_string(r.status) : r.errorText(), " ",
+                  r.body.size(), "B in ", sw.ms(), " ms");
+        return r;
     }
 
     static std::string fail(const char* op, const http::Response& r) {
@@ -333,6 +407,7 @@ private:
     }
 
     Result<void> updateGroup(const std::string& group, const std::string& accessKey, bool remove) {
+        LOG_INFO("rustfs: ", remove ? "removing " : "adding ", accessKey, remove ? " from group " : " to group ", group);
         Value body = Value::object();
         body.set("group", Value::str(group));
         Value members = Value::array();
@@ -341,7 +416,11 @@ private:
         body.set("groupStatus", Value::str("enabled"));
         body.set("isRemove", Value::boolean(remove));
         http::Response r = call("PUT", "/update-group-members", {}, body.toJson(0));
-        if (!r.ok()) return Result<void>::failure(fail("update-group-members", r));
+        if (!r.ok()) {
+            std::string err = fail("update-group-members", r);
+            LOG_ERROR(err);
+            return Result<void>::failure(err);
+        }
         return Result<void>::success();
     }
 
@@ -351,7 +430,11 @@ private:
         body.set("secretKey", Value::str(secret));
         body.set("status", Value::str(status == "disabled" ? "disabled" : "enabled"));
         http::Response r = call("PUT", "/add-user", {{"accessKey", accessKey}}, body.toJson(0));
-        if (!r.ok()) return Result<void>::failure(fail("add-user", r));
+        if (!r.ok()) {
+            std::string err = fail("add-user", r);
+            LOG_ERROR(err);
+            return Result<void>::failure(err);
+        }
         return Result<void>::success();
     }
 
@@ -406,7 +489,7 @@ private:
         std::string err;
         Value v = Value::parseJson(r.body, &err);
         if (!err.empty()) {
-            LOG_WARN("rustfs info-canned-policy: unparseable policy of ", accessKey);
+            LOG_WARN("rustfs info-canned-policy: unparseable policy of ", accessKey, ": ", err);
             return Value::null();
         }
         // RustFS wraps the document: {"policy_name":..., "policy":{...}, ...}
@@ -416,8 +499,13 @@ private:
 
     Result<void> putGrants(const std::string& accessKey, const Value& doc) {
         const std::string name = std::string(kGrantPrefix) + accessKey;
+        LOG_DEBUG("rustfs putGrants ", accessKey, ": policy ", name);
         http::Response r = call("PUT", "/add-canned-policy", {{"name", name}}, doc.toJson(0));
-        if (!r.ok()) return Result<void>::failure(fail("add-canned-policy", r));
+        if (!r.ok()) {
+            std::string err = fail("add-canned-policy", r);
+            LOG_ERROR(err);
+            return Result<void>::failure(err);
+        }
         // attach the grant policy to the user
         Value body = Value::object();
         Value arr = Value::array();
@@ -425,12 +513,17 @@ private:
         body.set("policies", arr);
         body.set("user", Value::str(accessKey));
         http::Response r2 = call("POST", "/idp/builtin/policy/attach", {}, body.toJson(0));
-        if (!r2.ok()) return Result<void>::failure(fail("attach", r2));
+        if (!r2.ok()) {
+            std::string err = fail("attach", r2);
+            LOG_ERROR(err);
+            return Result<void>::failure(err);
+        }
         return Result<void>::success();
     }
 
     Result<void> dropGrants(const std::string& accessKey) {
         const std::string name = std::string(kGrantPrefix) + accessKey;
+        LOG_DEBUG("rustfs dropGrants ", accessKey, ": policy ", name);
         Value body = Value::object();
         Value arr = Value::array();
         arr.push(Value::str(name));
@@ -457,9 +550,12 @@ public:
         try {
             s3::ClientOptions opts = options;
             opts.service = "s3";
+            LOG_INFO("rustfs: admin provider created for ", opts.endpoints.empty() ? std::string("<no endpoint>") : opts.endpoints.front(),
+                     " (access_key=", credentials.accessKey, ")");
             return Result<std::unique_ptr<IAdminProvider>>(
                 std::make_unique<RustfsAdmin>(opts, credentials));
         } catch (const std::exception& e) {
+            LOG_ERROR("rustfs: cannot create admin provider: ", e.what());
             return Result<std::unique_ptr<IAdminProvider>>::failure(
                 std::string("rustfs: ") + e.what());
         }
@@ -468,6 +564,7 @@ public:
     void adjustClientOptions(s3::ClientOptions& opts) override {
         opts.service = "s3";
         opts.pathStyle = true;
+        LOG_DEBUG("rustfs: client options adjusted: service=", opts.service, " path_style=", opts.pathStyle);
     }
 };
 

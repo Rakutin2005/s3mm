@@ -104,7 +104,8 @@ public:
     const std::string& pathTemplate() const { return pathTemplate_; }
 
     /// S3 targets need live clients; the engine injects them before shipping.
-    void bind(std::shared_ptr<s3::Client> destination, s3::Client* source);
+    /// Large objects are staged in `stagingDir` (falls back to /tmp when empty).
+    void bind(std::shared_ptr<s3::Client> destination, s3::Client* source, std::string stagingDir = {});
 
     Result<void> ship(const ShipRecord& record, const std::string& dataPath) override;
 
@@ -115,6 +116,7 @@ private:
     std::string pathTemplate_;
     std::shared_ptr<s3::Client> destination_;
     s3::Client* source_ = nullptr;
+    std::string stagingDir_;
     std::string renderKey(const ShipRecord& record) const;
 };
 

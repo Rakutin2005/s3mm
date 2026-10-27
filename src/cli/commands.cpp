@@ -7,8 +7,10 @@
 #include <sstream>
 
 #include "s3mm/cli/client.hpp"
+#include "s3mm/cli/s3cmd.hpp"
 #include "s3mm/common/error.hpp"
 #include "s3mm/common/fs.hpp"
+#include "s3mm/common/log.hpp"
 #include "s3mm/common/str.hpp"
 #include "s3mm/config/config.hpp"
 #include "s3mm/registry/mutate.hpp"
@@ -17,6 +19,22 @@
 namespace s3mm::cli {
 
 namespace {
+
+// ------------------------------------------------------------------- log ----
+
+/// Command line for the log: values of secret-looking `key=value` fields are
+/// masked (access_key ids stay visible).
+std::string describeArgs(const std::vector<std::string>& args) {
+    std::vector<std::string> out;
+    for (const auto& a : args) {
+        auto eq = a.find('=');
+        std::string key = str::toLower(eq == std::string::npos ? std::string() : a.substr(0, eq));
+        bool secretKey = key.find("secret") != std::string::npos || key.find("password") != std::string::npos ||
+                         key.find("token") != std::string::npos || key == "master_key" || key == "key";
+        out.push_back(secretKey ? a.substr(0, eq + 1) + log::redact(a.substr(eq + 1)) : a);
+    }
+    return str::join(out, " ");
+}
 
 // ------------------------------------------------------------------ args ----
 
@@ -331,13 +349,20 @@ Value buildRequest(const std::string& cmd, const std::vector<std::string>& rest)
 /// Apply a configuration mutation directly to the files (daemon unreachable).
 /// This is the moral equivalent of --permanent: the change is always written.
 int runOffline(const Options& opts, const std::string& cmd, const Value& req) {
+    LOG_WARN("daemon not reachable, applying '", cmd, "' directly to ", opts.config);
     std::cerr << "s3mm: note: daemon not reachable, applying '" << cmd
               << "' directly to " << opts.config << "\n";
 
     auto cfg = config::Config::load(opts.config);
-    if (!cfg) throw Error("cannot load configuration: " + cfg.error());
+    if (!cfg) {
+        LOG_ERROR("offline ", cmd, ": cannot load configuration ", opts.config, ": ", cfg.error());
+        throw Error("cannot load configuration: " + cfg.error());
+    }
     auto regRes = registry::Registry::fromConfig(cfg.value());
-    if (!regRes) throw Error("configuration error: " + regRes.error());
+    if (!regRes) {
+        LOG_ERROR("offline ", cmd, ": configuration error in ", opts.config, ": ", regRes.error());
+        throw Error("configuration error: " + regRes.error());
+    }
     registry::Registry reg = std::move(regRes.value());
 
     const Value& fields = registry::fieldsOf(req);
@@ -356,9 +381,14 @@ int runOffline(const Options& opts, const std::string& cmd, const Value& req) {
 
     if (changed) {
         const unsigned mode = fs::permissions(opts.config).value_or(0640);
-        if (!fs::writeFileAtomic(opts.config, reg.dump()))
+        if (!fs::writeFileAtomic(opts.config, reg.dump())) {
+            LOG_ERROR("offline ", cmd, ": cannot write ", opts.config);
             throw Error("cannot write " + opts.config);
+        }
         fs::setPermissions(opts.config, mode);
+        LOG_INFO("offline ", cmd, ": configuration written to ", opts.config);
+    } else {
+        LOG_DEBUG("offline ", cmd, ": nothing changed, configuration not rewritten");
     }
     std::cout << render(out, opts.format);
     return 0;
@@ -383,6 +413,8 @@ int runValidate(const Options& opts) {
     } else {
         problems.push_back(cfg.error());
     }
+    if (problems.empty()) LOG_INFO("validate: ", opts.config, " is valid");
+    for (const auto& p : problems) LOG_WARN("validate: ", opts.config, ": ", p);
 
     Value arr = Value::array();
     for (const auto& p : problems) arr.push(Value::str(p));
@@ -395,11 +427,20 @@ int runValidate(const Options& opts) {
 // ----------------------------------------------------------------- socket ----
 
 std::string resolveSocket(const Options& opts) {
-    if (!opts.socket.empty()) return opts.socket;
-    if (const char* env = std::getenv("S3MM_SOCKET"); env && *env) return env;
+    if (!opts.socket.empty()) {
+        LOG_DEBUG("socket from command line: ", opts.socket);
+        return opts.socket;
+    }
+    if (const char* env = std::getenv("S3MM_SOCKET"); env && *env) {
+        LOG_DEBUG("socket from S3MM_SOCKET: ", env);
+        return env;
+    }
     if (auto cfg = config::Config::load(opts.config))
-        if (auto reg = registry::Registry::fromConfig(cfg.value()))
+        if (auto reg = registry::Registry::fromConfig(cfg.value())) {
+            LOG_DEBUG("socket from ", opts.config, ": ", reg.value().settings().socket);
             return reg.value().settings().socket;
+        }
+    LOG_WARN("cannot determine the control socket from ", opts.config, ", using /run/s3mm/s3mm.sock");
     return "/run/s3mm/s3mm.sock";
 }
 
@@ -448,8 +489,27 @@ Commands:
   validate                        check the configuration files (-t does this)
   flush-config                    write daemon state back to the config files
 
+  check [cluster]                 availability of the clusters: every data
+                                  endpoint (ListBuckets with the cluster
+                                  credential) and, for managed clusters, every
+                                  admin_endpoint. Works without s3mmd too.
+
+S3 client (talks to the cluster directly with the credentials of the
+configuration; does not need s3mmd):
+  s3 info <cluster> [--no-count]  availability, buckets, object counts, sizes
+  s3 ls <cluster>                 list buckets
+  s3 ls <cluster> <bucket>[/<prefix>] [-r] [--limit N]
+                                  list objects (-r: recursive, no "folders")
+  s3 stat <cluster> <bucket>/<key>          object metadata
+  s3 get <cluster> <bucket>/<key> [<file>|-]  download (default: ./<basename>)
+  s3 put <cluster> <file> <bucket>[/<key>] [--content-type <type>]
+                                  upload (multipart above the part_size)
+  s3 rm <cluster> <bucket>/<key>  delete an object
+  s3 mb <cluster> <bucket>        create a bucket
+  s3 rb <cluster> <bucket> [--force]  delete a bucket (--force empties it first)
+
 Options:
-  -c, --config <file>     configuration file (default /etc/s3mm/s3mm.conf)
+  -c, --config <file>     configuration file (default /etc/s3mm/s3mmd.conf)
   -s, --socket <path>     control socket (default: $S3MM_SOCKET, then the
                           socket setting of the configuration, then
                           /run/s3mm/s3mm.sock)
@@ -471,12 +531,19 @@ Examples:
   s3mm rule add default "100 object source.size >= 1M action accept" --before 5
   s3mm -o json stat photos
   s3mm --permanent edit settings queue_time=10m
+  s3mm check minio1
+  s3mm s3 ls minio1 photos/2024/ -r
+  s3mm s3 put minio1 ./report.pdf docs/
+  s3mm s3 get minio1 docs/report.pdf /tmp/report.pdf
 )";
 }
 
 // ------------------------------------------------------------------- run ----
 
 int runCommand(const Options& opts, const std::vector<std::string>& args) {
+    LOG_INFO("command: ", args.empty() ? std::string("<none>") : describeArgs(args), " (config ", opts.config,
+             opts.socket.empty() ? "" : ", socket ", opts.socket, opts.permanent ? ", permanent" : "",
+             opts.test ? ", test" : "", ")");
     if (opts.test) return runValidate(opts);
     if (args.empty()) throw UsageError("no command given; try 's3mm --help'");
     const std::string cmd = args[0];
@@ -487,6 +554,8 @@ int runCommand(const Options& opts, const std::vector<std::string>& args) {
         return 0;
     }
     if (cmd == "validate") return runValidate(opts);
+    if (cmd == "s3") return runS3(opts, rest);
+    if (cmd == "check") return runCheck(opts, rest, resolveSocket(opts));
 
     // Build the request first: usage errors must not touch the socket.
     Value req = buildRequest(cmd, rest);
@@ -498,15 +567,23 @@ int runCommand(const Options& opts, const std::vector<std::string>& args) {
 
     const std::string socket = resolveSocket(opts);
     try {
+        log::Stopwatch sw;
+        LOG_DEBUG("sending '", effectiveCmd, "' to ", socket);
         Client client(socket);
         Value data = client.call(req);
+        LOG_INFO("command '", effectiveCmd, "' succeeded in ", sw.ms(), " ms");
         std::cout << render(data, opts.format);
         return 0;
-    } catch (const ConnectionError&) {
-        if (!offlineCapable)
+    } catch (const ConnectionError& e) {
+        LOG_WARN("cannot connect to ", socket, ": ", e.what());
+        if (!offlineCapable) {
+            LOG_ERROR("command '", effectiveCmd, "' needs a running s3mmd; ", socket, " is not reachable");
             throw Error("cannot connect to " + socket +
                         " (is s3mmd running?); use -s <socket> to override");
-        return runOffline(opts, effectiveCmd, req);
+        }
+        int rc = runOffline(opts, effectiveCmd, req);
+        LOG_INFO("command '", effectiveCmd, "' applied offline");
+        return rc;
     }
 }
 

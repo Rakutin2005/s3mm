@@ -2,12 +2,17 @@
 
 #include <sstream>
 
+#include "s3mm/common/log.hpp"
+
 namespace s3mm::repl {
 
 ReplicaStat& Stats::forReplication(const std::string& name) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto& s = stats_[name];
-    if (s.replication.empty()) s.replication = name;
+    if (s.replication.empty()) {
+        s.replication = name;
+        LOG_DEBUG("stats: counters created for replication '", name, "'");
+    }
     return s;
 }
 
@@ -31,13 +36,17 @@ std::vector<ReplicaStat> Stats::all() const {
 
 void Stats::reset(const std::string& name) {
     std::lock_guard<std::mutex> lock(mutex_);
+    LOG_INFO("stats: counters of replication '", name, "' reset", stats_.count(name) ? "" : " (none recorded)");
     stats_.erase(name);
 }
 
 void Stats::absorb(const Stats& other) {
     if (this == &other) return;
     std::scoped_lock lock(mutex_, other.mutex_);
-    for (const auto& [name, s] : other.stats_) stats_.try_emplace(name, s);
+    size_t carried = 0;
+    for (const auto& [name, s] : other.stats_)
+        if (stats_.try_emplace(name, s).second) carried++;
+    LOG_DEBUG("stats: carried over counters of ", carried, " of ", other.stats_.size(), " replication(s)");
 }
 
 std::string Stats::prometheus(const std::vector<std::string>& replicationNames) const {
@@ -77,7 +86,10 @@ std::string Stats::prometheus(const std::vector<std::string>& replicationNames) 
     emit("s3mm_lag_seconds", "Replication lag of the last delivery", "gauge", forNames([](const ReplicaStat& s) { return (long double)s.lastLagSec; }));
     emit("s3mm_last_scan_duration_ms", "Duration of the last scan", "gauge", forNames([](const ReplicaStat& s) { return (long double)s.lastScanMs; }));
     emit("s3mm_in_flight", "Scan/ship currently running", "gauge", forNames([](const ReplicaStat& s) { return s.inFlight ? 1.0L : 0.0L; }));
-    return os.str();
+    std::string text = os.str();
+    LOG_DEBUG("stats: rendered prometheus exposition for ", replicationNames.size(), " replication(s), ", text.size(),
+              " bytes");
+    return text;
 }
 
 } // namespace s3mm::repl

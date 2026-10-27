@@ -1,5 +1,7 @@
 #include "s3mm/replication/cache.hpp"
 
+#include <cerrno>
+#include <cstring>
 #include <sstream>
 
 #include "s3mm/common/fs.hpp"
@@ -82,18 +84,31 @@ void BucketCache::clear() { entries_.clear(); }
 
 Result<void> BucketCache::load() {
     entries_.clear();
-    if (path_.empty() || !fs::exists(path_)) return Result<void>::success();
+    if (path_.empty() || !fs::exists(path_)) {
+        LOG_DEBUG("delta cache ", path_.empty() ? std::string("<no path>") : path_, " absent: starting empty");
+        return Result<void>::success();
+    }
+    log::Stopwatch sw;
     auto content = fs::readFile(path_);
-    if (!content) return Result<void>::failure("cannot read cache " + path_);
+    if (!content) {
+        LOG_ERROR("delta cache: cannot read ", path_);
+        return Result<void>::failure("cannot read cache " + path_);
+    }
     std::istringstream is(*content);
     std::string line;
-    if (!std::getline(is, line) || (line != kMagicV1 && line != kMagicV2))
+    if (!std::getline(is, line) || (line != kMagicV1 && line != kMagicV2)) {
+        LOG_ERROR("delta cache: unsupported format in ", path_, " (header '", log::clip(line, 64), "')");
         return Result<void>::failure("unsupported cache format in " + path_);
+    }
     const bool v2 = line == kMagicV2;
     const size_t keyColumn = v2 ? 11 : 8;
+    size_t malformed = 0;
     while (std::getline(is, line)) {
         auto cols = str::split(line, '\t', true);
-        if (cols.size() < keyColumn) continue;
+        if (cols.size() < keyColumn) {
+            malformed++;
+            continue;
+        }
         CacheEntry e;
         e.size = std::strtoull(cols[1].c_str(), nullptr, 10);
         e.etag = cols[2];
@@ -117,13 +132,27 @@ Result<void> BucketCache::load() {
         if (!key.empty()) {
             e.key = std::move(key);
             entries_[e.key] = std::move(e);
+        } else {
+            malformed++;
         }
     }
+    if (malformed > 0) LOG_WARN("delta cache ", path_, ": ", malformed, " malformed line(s) ignored");
+    size_t tombstones = 0, pending = 0;
+    for (const auto& [key, e] : entries_) {
+        if (e.deleted) tombstones++;
+        else if (!e.shipped) pending++;
+    }
+    LOG_DEBUG("delta cache loaded from ", path_, " (", v2 ? "v2" : "v1", "): ", entries_.size(), " entries, ", pending,
+              " pending, ", tombstones, " tombstones, ", content->size(), " bytes in ", sw.ms(), " ms");
     return Result<void>::success();
 }
 
 Result<void> BucketCache::save() const {
-    if (path_.empty()) return Result<void>::failure("cache has no path");
+    if (path_.empty()) {
+        LOG_ERROR("delta cache save: cache has no path");
+        return Result<void>::failure("cache has no path");
+    }
+    log::Stopwatch sw;
     std::ostringstream os;
     os << kMagicV2 << "\n";
     for (const auto& [key, e] : entries_) {
@@ -134,8 +163,13 @@ Result<void> BucketCache::save() const {
            << (e.metadataHash.empty() ? std::string("-") : e.metadataHash) << "\t"
            << (e.tagsHash.empty() ? std::string("-") : e.tagsHash) << "\t" << e.key << "\n";
     }
-    if (!fs::writeFileAtomic(path_, os.str()))
+    std::string body = os.str();
+    if (!fs::writeFileAtomic(path_, body)) {
+        LOG_ERROR("delta cache: cannot write ", path_, ": ", std::strerror(errno));
         return Result<void>::failure("cannot write cache " + path_);
+    }
+    LOG_DEBUG("delta cache saved to ", path_, ": ", entries_.size(), " entries, ", body.size(), " bytes in ", sw.ms(),
+              " ms");
     return Result<void>::success();
 }
 
@@ -159,7 +193,10 @@ void StateStore::loadBucketDeletes(const std::string& replication, const std::st
     if (loadedBucketDeletes_.count(group)) return;
     loadedBucketDeletes_.insert(group);
     std::string path = bucketDeletesPath(replication, source);
-    if (!fs::exists(path)) return;
+    if (!fs::exists(path)) {
+        LOG_DEBUG("bucket delete state ", path, " absent");
+        return;
+    }
     auto content = fs::readFile(path);
     if (!content) {
         LOG_WARN("bucket delete state: cannot read ", path);
@@ -171,13 +208,23 @@ void StateStore::loadBucketDeletes(const std::string& replication, const std::st
         LOG_WARN("bucket delete state: unsupported format in ", path);
         return;
     }
+    size_t loaded = 0, bad = 0;
     while (std::getline(is, line)) {
         auto cols = str::split(line, '\t', true);
-        if (cols.size() < 2) continue;
+        if (cols.size() < 2) {
+            bad++;
+            continue;
+        }
         auto when = tm::fromIso8601(cols[1]);
-        if (!when) continue;
+        if (!when) {
+            bad++;
+            continue;
+        }
         bucketDeletes_[group + "/" + cols[0]] = *when;
+        loaded++;
     }
+    if (bad > 0) LOG_WARN("bucket delete state ", path, ": ", bad, " malformed line(s) ignored");
+    LOG_DEBUG("bucket delete state loaded from ", path, ": ", loaded, " missing bucket(s)");
 }
 
 BucketCache& StateStore::bucket(const std::string& replication, const std::string& source, const std::string& bucket) {
@@ -186,7 +233,12 @@ BucketCache& StateStore::bucket(const std::string& replication, const std::strin
     if (it != caches_.end()) return it->second;
     BucketCache cache(cachePath(replication, source, bucket));
     auto loaded = cache.load();
-    if (!loaded) LOG_WARN("delta cache: ", loaded.error());
+    if (!loaded)
+        LOG_WARN("delta cache for replication '", replication, "' bucket ", source, "/", bucket, ": ", loaded.error(),
+                 "; starting with an empty cache (full rescan)");
+    else
+        LOG_DEBUG("delta cache for replication '", replication, "' bucket ", source, "/", bucket, ": ", cache.size(),
+                  " entries");
     return caches_.emplace(key, std::move(cache)).first->second;
 }
 
@@ -227,6 +279,7 @@ bool StateStore::markBucketMissing(const std::string& replication, const std::st
     auto it = bucketDeletes_.find(key);
     if (it != bucketDeletes_.end()) return false;
     bucketDeletes_[key] = when;
+    LOG_DEBUG("bucket delete state: ", key, " marked missing since ", tm::toIso8601(when));
     return true;
 }
 
@@ -238,18 +291,24 @@ void StateStore::clearBucketMissing(const std::string& replication, const std::s
 
 void StateStore::forgetBucket(const std::string& replication, const std::string& source,
                               const std::string& bucket) {
+    LOG_DEBUG("forgetting bucket state ", replication, "/", source, "/", bucket);
     caches_.erase(replication + "/" + source + "/" + bucket);
     settingsHashes_.erase(replication + "/" + bucket);
     clearBucketMissing(replication, source, bucket);
-    fs::removeFile(cachePath(replication, source, bucket));
+    if (!fs::removeFile(cachePath(replication, source, bucket)))
+        LOG_DEBUG("delta cache file ", cachePath(replication, source, bucket), " not removed (absent?)");
 }
 
 Result<void> StateStore::persist() {
     std::error_code ec;
-    fs::mkdirp(root_);
+    log::Stopwatch sw;
+    if (!fs::mkdirp(root_)) LOG_WARN("state store: cannot create ", root_, ": ", std::strerror(errno));
     for (const auto& [key, cache] : caches_) {
         auto res = cache.save();
-        if (!res) return res;
+        if (!res) {
+            LOG_ERROR("state store: persisting cache ", key, " failed: ", res.error());
+            return res;
+        }
     }
     // write per replication to keep flushes isolated
     std::map<std::string, std::string> perReplication;
@@ -260,8 +319,10 @@ Result<void> StateStore::persist() {
     }
     for (const auto& [rep, body] : perReplication) {
         std::string path = settingsPath(rep);
-        if (!fs::writeFileAtomic(path, std::string("s3mm-bucket-settings-v1\n") + body))
+        if (!fs::writeFileAtomic(path, std::string("s3mm-bucket-settings-v1\n") + body)) {
+            LOG_ERROR("state store: cannot write ", path, ": ", std::strerror(errno));
             return Result<void>::failure("cannot write " + path);
+        }
     }
     std::map<std::string, std::string> perSource;
     for (const auto& group : loadedBucketDeletes_) perSource[group]; // rewrite empty groups too
@@ -278,13 +339,18 @@ Result<void> StateStore::persist() {
         auto slash = group.find('/');
         if (slash == std::string::npos) continue;
         std::string path = bucketDeletesPath(group.substr(0, slash), group.substr(slash + 1));
-        if (!fs::writeFileAtomic(path, std::string("s3mm-bucket-deletes-v1\n") + body))
+        if (!fs::writeFileAtomic(path, std::string("s3mm-bucket-deletes-v1\n") + body)) {
+            LOG_ERROR("state store: cannot write ", path, ": ", std::strerror(errno));
             return Result<void>::failure("cannot write " + path);
+        }
     }
+    LOG_DEBUG("state store ", root_, " persisted: ", caches_.size(), " cache(s), ", perReplication.size(),
+              " settings file(s), ", perSource.size(), " delete-state file(s) in ", sw.ms(), " ms");
     return Result<void>::success();
 }
 
 Result<void> StateStore::reset(const std::string& replication) {
+    LOG_INFO("state store: resetting delta state of replication '", replication, "' under ", root_);
     for (auto it = caches_.begin(); it != caches_.end();) {
         if (str::startsWith(it->first, replication + "/")) it = caches_.erase(it);
         else ++it;

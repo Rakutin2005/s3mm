@@ -1,4 +1,5 @@
 #pragma once
+#include <chrono>
 #include <initializer_list>
 #include <sstream>
 #include <string>
@@ -24,19 +25,27 @@ struct Options {
     std::string ident = "s3mm";
     Level level = Level::Info;
     Facility facility = Facility::Daemon;
-    bool toStderr = true; // used when syslog is unavailable (dev/tests)
     std::string socketPath = "/dev/log";
 };
 
+/// Logging goes to syslog only. Before init() nothing is written, so
+/// library code may log unconditionally (unit tests stay quiet).
 void init(const Options& options);
 void shutdown();
 bool initialized();
 const Options& options();
 bool enabled(Level l);
 
-/// Write one RFC 5424 message to syslog (SOCK_DGRAM /dev/log) with a stderr fallback.
+/// Write one RFC 5424 message to syslog (SOCK_DGRAM, default /dev/log).
+/// The socket is reconnected transparently when syslog restarts; messages
+/// that cannot be delivered are dropped (never written to stdout/stderr).
 void write(Level l, const std::string& message,
            std::initializer_list<std::pair<std::string, std::string>> sd = {});
+
+/// Mask a secret for logging: "<empty>" or "***(N bytes)".
+std::string redact(const std::string& secret);
+/// Shorten long payloads for logging: first `max` bytes + "...(N bytes)".
+std::string clip(const std::string& s, size_t max = 256);
 
 template <class... Args>
 std::string fmtstr(Args&&... args) {
@@ -58,10 +67,25 @@ template <class... Args> void warn(Args&&... a)     { emit(Level::Warning, std::
 template <class... Args> void error(Args&&... a)    { emit(Level::Error, std::forward<Args>(a)...); }
 template <class... Args> void critical(Args&&... a) { emit(Level::Critical, std::forward<Args>(a)...); }
 
+/// Milliseconds elapsed since construction (for "... done in N ms" messages).
+class Stopwatch {
+public:
+    Stopwatch() : start_(std::chrono::steady_clock::now()) {}
+    long long ms() const {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_).count();
+    }
+private:
+    std::chrono::steady_clock::time_point start_;
+};
+
 } // namespace s3mm::log
 
-#define S3MM_LOG_AT(lvl, ...) \
-    ::s3mm::log::write(lvl, ::s3mm::log::fmtstr(__VA_ARGS__), {{"file", __FILE__}, {"line", std::to_string(__LINE__)}})
+#define S3MM_LOG_AT(lvl, ...)                                                                              \
+    do {                                                                                                   \
+        if (::s3mm::log::initialized() && ::s3mm::log::enabled(lvl))                                       \
+            ::s3mm::log::write(lvl, ::s3mm::log::fmtstr(__VA_ARGS__),                                      \
+                               {{"file", __FILE__}, {"line", std::to_string(__LINE__)}});                  \
+    } while (0)
 
 #define LOG_DEBUG(...)    S3MM_LOG_AT(::s3mm::log::Level::Debug, __VA_ARGS__)
 #define LOG_INFO(...)     S3MM_LOG_AT(::s3mm::log::Level::Info, __VA_ARGS__)

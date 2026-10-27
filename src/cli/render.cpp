@@ -4,6 +4,7 @@
 #include <sstream>
 
 #include "s3mm/common/error.hpp"
+#include "s3mm/common/log.hpp"
 
 namespace s3mm::cli {
 
@@ -11,6 +12,7 @@ Format formatFromString(const std::string& s) {
     if (s.empty() || s == "table") return Format::Table;
     if (s == "json") return Format::Json;
     if (s == "yaml") return Format::Yaml;
+    LOG_WARN("unknown output format '", s, "'");
     throw UsageError("unknown output format '" + s + "' (table|json|yaml)");
 }
 
@@ -150,6 +152,8 @@ void emitObject(std::ostringstream& os, const std::string& indent, const Value& 
 } // namespace
 
 std::string render(const Value& v, Format f) {
+    LOG_DEBUG("rendering ", v.isArray() ? "array" : v.isObject() ? "object" : "value", " of ", v.size(),
+              " item(s) as ", f == Format::Json ? "json" : f == Format::Yaml ? "yaml" : "table");
     if (f == Format::Json) {
         std::string out = v.toJson(2);
         if (out.empty() || out.back() != '\n') out += "\n";

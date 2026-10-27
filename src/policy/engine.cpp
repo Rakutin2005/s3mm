@@ -38,7 +38,8 @@ void Engine::applyActionRouting(const Action& primary, const RouteTable& routes,
         out.outcome = "warning";
         out.target = primary.param("name", routes.warning.empty() ? "quarantine" : routes.warning);
     } else if (primary.name == "redirect") {
-        out.outcome = "success";
+        // redirect without a target batch has no outcome; the caller decides
+        out.outcome = primary.positional.empty() ? std::string() : std::string("success");
         out.target = primary.positional;
     } else if (primary.name == "pass") {
         out.outcome.clear();
@@ -52,6 +53,8 @@ Decision Engine::evaluate(const Bundle& bundle, Category category, const Context
     for (const auto& rule : bundle.rules) {
         if (rule.category != category) continue;
         if (!rule.matches(ctx)) continue;
+        LOG_DEBUG("policy '", bundle.name, "' [", replicationName, "] ", categoryName(category), ": rule ", rule.order,
+                  rule.name.empty() ? std::string() : " (" + rule.name + ")", " matched");
         // find the outcome action of this rule
         const Action* primary = nullptr;
         for (const auto& a : rule.actions) {
@@ -61,13 +64,25 @@ Decision Engine::evaluate(const Bundle& bundle, Category category, const Context
                 break;
             }
         }
-        if (!primary) continue; // rule without outcome action: nothing to decide
-        if (primary->name == "pass") continue; // pass = fall through to the next rule
+        if (!primary) { // rule without outcome action: nothing to decide
+            LOG_DEBUG("policy '", bundle.name, "' [", replicationName, "]: rule ", rule.order,
+                      " has no outcome action, continuing");
+            continue;
+        }
+        if (primary->name == "pass") { // pass = fall through to the next rule
+            LOG_DEBUG("policy '", bundle.name, "' [", replicationName, "]: rule ", rule.order, " passes, continuing");
+            continue;
+        }
         Decision d;
         d.rule = &rule;
         d.actions = rule.actions;
         applyActionRouting(*primary, bundle.routes, replicationName, d);
         if (d.outcome.empty()) continue;
+        if (d.target.empty())
+            LOG_WARN("policy '", bundle.name, "' [", replicationName, "]: rule ", rule.order, " action ",
+                     primary->toString(), " yields no target");
+        LOG_DEBUG("policy '", bundle.name, "' [", replicationName, "] ", categoryName(category), ": action ",
+                  primary->toString(), " -> ", d.toString());
         return d;
     }
 
@@ -88,7 +103,15 @@ Decision Engine::evaluate(const Bundle& bundle, Category category, const Context
             d.outcome = "success";
             d.target = bundle.routes.success.empty() ? replicationName + "-rqueue" : bundle.routes.success;
         }
+        if (redirectNoTarget)
+            LOG_WARN("policy '", bundle.name, "' [", replicationName, "]: default action redirect has no target batch, "
+                     "routing to denied (", d.target, ")");
+        else
+            LOG_DEBUG("policy '", bundle.name, "' [", replicationName, "]: default action ", def.toString(),
+                      " has no outcome, falling back to ", d.outcome);
     }
+    LOG_DEBUG("policy '", bundle.name, "' [", replicationName, "] ", categoryName(category),
+              ": no rule matched, default action ", def.toString(), " -> ", d.toString());
     return d;
 }
 

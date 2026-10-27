@@ -33,6 +33,8 @@ Result<void> Registry::parseQueueBlock(const Node& node) {
         else if (c.name == "max_disk") settings_.maxDiskBytes = (int64_t)units::parseSize(c.argOr(0, "10G"));
         else return Result<void>::failure(loc(c) + ": unknown queue directive '" + c.name + "'");
     }
+    LOG_DEBUG("registry: queue settings size=", settings_.queueSizeBytes, " period=", settings_.queuePeriodSec,
+              "s min_size=", settings_.minSizeBytes, " max_disk=", settings_.maxDiskBytes);
     return Result<void>::success();
 }
 
@@ -45,10 +47,13 @@ Result<void> Registry::parseTransferBlock(const Node& node) {
         else if (c.name == "rate_limit") settings_.rateLimitPerSec = str::parseDouble(c.argOr(0, "0")).value_or(0);
         else return Result<void>::failure(loc(c) + ": unknown transfer directive '" + c.name + "'");
     }
+    LOG_DEBUG("registry: transfer settings parallel=", settings_.transferParallel, " part_size=", settings_.partSize,
+              " retries=", settings_.retries, " backoff=", settings_.backoffSec, "s rate_limit=", settings_.rateLimitPerSec);
     return Result<void>::success();
 }
 
 Result<void> Registry::parseSettings(const Node& node) {
+    LOG_DEBUG("registry: parsing settings from ", loc(node));
     for (const auto& c : node.children) {
         try {
             if (c.name == "socket") settings_.socket = c.argRequired(0);
@@ -89,10 +94,20 @@ Result<void> Registry::parseSettings(const Node& node) {
         }
     }
     if (!settings_.masterKeyFile.empty()) {
+        LOG_DEBUG("registry: reading master key from ", settings_.masterKeyFile);
         auto content = fs::readSecretFile(settings_.masterKeyFile);
-        if (!content) return Result<void>::failure(loc(node) + ": master_key_file: " + content.value_or("unreadable"));
-        settings_.masterKey = str::trim(*content);
+        if (!content) {
+            LOG_ERROR("registry: cannot read master_key_file ", settings_.masterKeyFile, ": ",
+                      content.error());
+            return Result<void>::failure(loc(node) + ": master_key_file: " + content.error());
+        }
+        settings_.masterKey = str::trim(content.value());
     }
+    LOG_DEBUG("registry: settings socket=", settings_.socket, " pid_file=", settings_.pidFile, " cache_dir=",
+              settings_.cacheDir, " secrets_dir=", settings_.secretsDir, " modules_dir=", settings_.modulesDir,
+              " workers=", settings_.workerCount, " metrics=", settings_.metricsListen, " log=", settings_.logLevel,
+              "/", settings_.logFacility, " scan_every=", settings_.scanEverySec, "s master_key=",
+              settings_.masterKey.empty() ? std::string("none") : log::redact(settings_.masterKey));
     return Result<void>::success();
 }
 
@@ -121,6 +136,7 @@ Result<void> Registry::parseCluster(const Node& node) {
             else if (d.name == "retries") c.retries = (int)d.int64Value("retries", 5);
             else if (d.name == "description") c.description = d.argOr(0);
             else if (d.name == "managed") c.managed = d.boolFlag(true);
+            else if (d.name == "admin_endpoint" || d.name == "admin_addr") c.adminEndpoints.push_back(d.argRequired(0));
             else return Result<void>::failure(loc(d) + ": unknown directive '" + d.name + "' in cluster '" + c.name + "'");
         } catch (const Error& e) {
             return Result<void>::failure(loc(d) + ": " + e.what());
@@ -128,6 +144,13 @@ Result<void> Registry::parseCluster(const Node& node) {
     }
     if (c.endpoints.empty()) return Result<void>::failure(loc(node) + ": cluster '" + c.name + "' has no addr");
     if (c.alias.empty()) c.alias = c.name;
+    LOG_DEBUG("registry: parsed cluster '", c.name, "' at ", loc(node), ": alias=", c.alias, " endpoints=",
+              str::join(c.endpoints, ","), " vendor=", c.vendor, " credentials=", str::join(c.credentials, ","),
+              " path_style=", c.pathStyle ? "on" : "off", " insecure=", c.insecure ? "on" : "off", " managed=",
+              c.managed ? "on" : "off", " admin_endpoints=",
+              c.adminEndpoints.empty() ? std::string("<data endpoints>") : str::join(c.adminEndpoints, ","));
+    if (!c.managed && !c.adminEndpoints.empty())
+        LOG_WARN("registry: cluster '", c.name, "' at ", loc(node), " is unmanaged, admin_endpoint is ignored");
     return addCluster(std::move(c));
 }
 
@@ -144,9 +167,10 @@ Result<void> Registry::parseCredential(const Node& node) {
             else if (d.name == "access_key") c.accessKey = d.argRequired(0);
             else if (d.name == "secret_key") { c.secretKey = d.argRequired(0); c.secretIsPlain = true; }
             else if (d.name == "secret_key_file") {
+                LOG_DEBUG("registry: credential '", c.name, "': reading secret from ", d.argOr(0));
                 auto content = fs::readSecretFile(d.argRequired(0));
-                if (!content) throw Error("secret_key_file: " + content.value_or("unreadable"));
-                c.secretKey = str::trim(*content);
+                if (!content) throw Error("secret_key_file: " + content.error());
+                c.secretKey = str::trim(content.value());
                 c.secretIsPlain = false;
             } else if (d.name == "session_token") c.sessionToken = d.argRequired(0);
             else if (d.name == "region") c.region = d.argRequired(0);
@@ -162,9 +186,17 @@ Result<void> Registry::parseCredential(const Node& node) {
         if (settings_.masterKey.empty())
             return Result<void>::failure(loc(node) + ": credential '" + c.name + "' uses a sealed secret but no master_key is configured");
         auto opened = secret::open(c.secretKey, settings_.masterKey);
-        if (!opened) return Result<void>::failure(loc(node) + ": credential '" + c.name + "': " + opened.error());
+        if (!opened) {
+            LOG_ERROR("registry: cannot unseal secret of credential '", c.name, "': ", opened.error());
+            return Result<void>::failure(loc(node) + ": credential '" + c.name + "': " + opened.error());
+        }
         c.secretKey = opened.value();
+        LOG_DEBUG("registry: credential '", c.name, "': sealed secret opened with the master key");
     }
+    LOG_DEBUG("registry: parsed credential '", c.name, "' at ", loc(node), ": access_key=", c.accessKey,
+              " secret=", log::redact(c.secretKey), c.secretIsPlain ? " (inline)" : " (file)",
+              c.cluster.empty() ? "" : " cluster=", c.cluster, c.sessionToken.empty() ? "" : " session_token=",
+              c.sessionToken.empty() ? std::string() : log::redact(c.sessionToken), c.readOnly ? " read_only" : "");
     return addCredential(std::move(c));
 }
 
@@ -206,6 +238,10 @@ Result<void> Registry::parseReplication(const Node& node) {
     if (r.buckets.empty()) r.buckets = {"*"};
     if (r.accounts.empty()) r.accounts = {"*"};
     if (r.policy.empty()) r.policy = "default";
+    LOG_DEBUG("registry: parsed replication '", r.name, "' at ", loc(node), ": ", r.source, " -> ", r.destination,
+              " buckets=", str::join(r.buckets, ","), " accounts=", str::join(r.accounts, ","), " policy=", r.policy,
+              " scan_every=", r.scanEverySec, "s delete_propagation=", r.deletePropagation ? "on" : "off",
+              r.paused ? " paused" : "");
     return addReplication(std::move(r));
 }
 
@@ -229,9 +265,11 @@ Result<void> Registry::parseTarget(const Node& node) {
         else if (str::startsWith(t.uri, "file:")) t.kind = "file";
         else if (t.uri.empty()) t.kind = "null";
         else t.kind = "file";
+        LOG_DEBUG("registry: target '", t.name, "': type inferred from uri as ", t.kind);
     }
     if (t.kind == "s3" && !str::startsWith(t.uri, "s3://"))
         return Result<void>::failure(loc(node) + ": s3 target uri must look like s3://cluster/bucket/prefix");
+    LOG_DEBUG("registry: parsed target '", t.name, "' at ", loc(node), ": type=", t.kind, " uri=", t.uri);
     return addTarget(std::move(t));
 }
 
@@ -243,20 +281,26 @@ Result<void> Registry::parsePolicy(const Node& node) {
     // A config block may override a built-in bundle ("default", "drop-all");
     // fromConfig() pre-inserts the built-ins, and dump() writes them back out.
     const std::string name = bundle.value().name;
-    if ((name == "default" || name == "drop-all") && bundles_.count(name))
+    LOG_DEBUG("registry: parsed policy bundle '", name, "' at ", loc(node), ": ", bundle.value().rules.size(), " rule(s)");
+    if ((name == "default" || name == "drop-all") && bundles_.count(name)) {
+        LOG_DEBUG("registry: policy bundle '", name, "' overrides the built-in");
         return updateBundle(name, bundle.value());
+    }
     return addBundle(bundle.value());
 }
 
 // ---------------------------------------------------------------- registry --
 
 Result<Registry> Registry::fromConfig(const config::Config& cfg) {
+    log::Stopwatch sw;
+    LOG_DEBUG("registry: building from ", cfg.path().empty() ? std::string("<memory>") : cfg.path());
     Registry registry;
     const config::Node* rootPtr = cfg.s3mm();
     config::Node synthetic;
     if (!rootPtr) {
         // Allow config files without the legacy "s3mm { ... }" wrapper:
         // treat all top-level nodes as the contents of the implicit root.
+        LOG_DEBUG("registry: no s3mm root block, using the top-level nodes as implicit root");
         synthetic.name = "s3mm";
         synthetic.block = true;
         for (const auto& r : cfg.roots()) synthetic.children.push_back(r);
@@ -265,7 +309,10 @@ Result<Registry> Registry::fromConfig(const config::Config& cfg) {
     const Node& root = *rootPtr;
 
     auto settingsRes = registry.parseSettings(root);
-    if (!settingsRes) return Result<Registry>::failure(settingsRes.error());
+    if (!settingsRes) {
+        LOG_ERROR("registry: settings: ", settingsRes.error());
+        return Result<Registry>::failure(settingsRes.error());
+    }
 
     // built-in bundles always exist
     registry.bundles_["drop-all"] = policy::Bundle::builtin("drop-all");
@@ -281,7 +328,10 @@ Result<Registry> Registry::fromConfig(const config::Config& cfg) {
     for (const Node* np : credNodes) {
         const Node& c = *np;
         auto res = registry.parseCredential(c);
-        if (!res) return Result<Registry>::failure(res.error());
+        if (!res) {
+            LOG_ERROR("registry: credential '", c.argOr(0), "': ", res.error());
+            return Result<Registry>::failure(res.error());
+        }
     }
     for (const Node* np : otherNodes) {
         const Node& c = *np;
@@ -290,25 +340,39 @@ Result<Registry> Registry::fromConfig(const config::Config& cfg) {
         else if (c.name == "policy" && c.block) res = registry.parsePolicy(c);
         else if (c.name == "replication" && c.block) res = registry.parseReplication(c);
         else if (c.name == "target" && c.block) res = registry.parseTarget(c);
-        if (!res) return Result<Registry>::failure(res.error());
+        if (!res) {
+            LOG_ERROR("registry: ", c.name, " '", c.argOr(0), "': ", res.error());
+            return Result<Registry>::failure(res.error());
+        }
     }
 
     // resolve replication references
     for (const auto& r : registry.replications_) {
-        if (!registry.cluster(r.source)) return Result<Registry>::failure("replication '" + r.name + "': unknown source cluster '" + r.source + "'");
-        if (!registry.cluster(r.destination)) return Result<Registry>::failure("replication '" + r.name + "': unknown destination cluster '" + r.destination + "'");
-        if (!registry.bundle(r.policy)) return Result<Registry>::failure("replication '" + r.name + "': unknown policy bundle '" + r.policy + "'");
+        std::string err;
+        if (!registry.cluster(r.source)) err = "replication '" + r.name + "': unknown source cluster '" + r.source + "'";
+        else if (!registry.cluster(r.destination)) err = "replication '" + r.name + "': unknown destination cluster '" + r.destination + "'";
+        else if (!registry.bundle(r.policy)) err = "replication '" + r.name + "': unknown policy bundle '" + r.policy + "'";
+        if (!err.empty()) {
+            LOG_ERROR("registry: ", err);
+            return Result<Registry>::failure(err);
+        }
     }
     for (const auto& c : registry.clusters_)
         for (const auto& credName : c.credentials)
-            if (!registry.credential(credName))
+            if (!registry.credential(credName)) {
+                LOG_ERROR("registry: cluster '", c.name, "': unknown credential '", credName, "'");
                 return Result<Registry>::failure("cluster '" + c.name + "': unknown credential '" + credName + "'");
+            }
 
     // remember the config files that were loaded (flush-config writes back to them)
     registry.sources_.push_back(cfg.path().empty() ? std::string("<memory>") : cfg.path());
     for (const auto& root : cfg.roots())
         if (!root.file.empty() && root.file != registry.sources_.front())
             registry.sources_.push_back(root.file);
+    LOG_DEBUG("registry: built in ", sw.ms(), " ms: ", registry.clusters_.size(), " cluster(s), ",
+              registry.credentials_.size(), " credential(s), ", registry.replications_.size(), " replication(s), ",
+              registry.targets_.size(), " target(s), ", registry.bundles_.size(), " bundle(s); sources: ",
+              str::join(registry.sources_, ", "));
     return Result<Registry>(std::move(registry));
 }
 
@@ -384,6 +448,7 @@ Result<void> Registry::addCluster(Cluster c) {
             return Result<void>::failure("cluster '" + c.name + "' (alias '" + c.alias + "') already exists");
     for (const auto& cred : c.credentials)
         if (!credential(cred)) return Result<void>::failure("cluster '" + c.name + "': unknown credential '" + cred + "'");
+    LOG_DEBUG("registry: cluster '", c.name, "' added");
     clusters_.push_back(std::move(c));
     return Result<void>::success();
 }
@@ -393,6 +458,7 @@ Result<void> Registry::updateCluster(const std::string& name, Cluster c) {
         if (existing.name != name) continue;
         existing = c;
         existing.name = name;
+        LOG_DEBUG("registry: cluster '", name, "' updated");
         return Result<void>::success();
     }
     return Result<void>::failure("no cluster '" + name + "'");
@@ -408,6 +474,7 @@ Result<void> Registry::removeCluster(const std::string& name) {
     clusters_.erase(std::remove_if(clusters_.begin(), clusters_.end(),
                                    [&](const Cluster& x) { return x.name == canonical; }),
                     clusters_.end());
+    LOG_DEBUG("registry: cluster '", canonical, "' removed");
     return Result<void>::success();
 }
 
@@ -418,6 +485,7 @@ Result<void> Registry::addCredential(Credential c) {
             return Result<void>::failure("credential '" + c.name + "'" +
                                          (c.cluster.empty() ? " (global)" : " on cluster '" + c.cluster + "'") + " already exists");
     if (!c.cluster.empty() && !cluster(c.cluster)) return Result<void>::failure("unknown cluster '" + c.cluster + "'");
+    LOG_DEBUG("registry: credential '", c.name, "' added");
     credentials_.push_back(std::move(c));
     return Result<void>::success();
 }
@@ -427,6 +495,7 @@ Result<void> Registry::updateCredential(const std::string& name, Credential c) {
         if (existing.name != name) continue;
         existing = c;
         existing.name = name;
+        LOG_DEBUG("registry: credential '", name, "' updated");
         return Result<void>::success();
     }
     return Result<void>::failure("no credential '" + name + "'");
@@ -441,6 +510,7 @@ Result<void> Registry::removeCredential(const std::string& name) {
                                       [&](const Credential& x) { return x.name == name; }),
                        credentials_.end());
     if (credentials_.size() == before) return Result<void>::failure("no credential '" + name + "'");
+    LOG_DEBUG("registry: credential '", name, "' removed");
     return Result<void>::success();
 }
 
@@ -450,6 +520,7 @@ Result<void> Registry::addReplication(Replication r) {
     if (!cluster(r.source)) return Result<void>::failure("unknown source cluster '" + r.source + "'");
     if (!cluster(r.destination)) return Result<void>::failure("unknown destination cluster '" + r.destination + "'");
     if (!bundle(r.policy)) return Result<void>::failure("unknown policy bundle '" + r.policy + "'");
+    LOG_DEBUG("registry: replication '", r.name, "' added");
     replications_.push_back(std::move(r));
     return Result<void>::success();
 }
@@ -459,6 +530,7 @@ Result<void> Registry::updateReplication(const std::string& name, Replication r)
         if (existing.name != name) continue;
         existing = r;
         existing.name = name;
+        LOG_DEBUG("registry: replication '", name, "' updated");
         return Result<void>::success();
     }
     return Result<void>::failure("no replication '" + name + "'");
@@ -470,12 +542,14 @@ Result<void> Registry::removeReplication(const std::string& name) {
                                        [&](const Replication& x) { return x.name == name; }),
                         replications_.end());
     if (replications_.size() == before) return Result<void>::failure("no replication '" + name + "'");
+    LOG_DEBUG("registry: replication '", name, "' removed");
     return Result<void>::success();
 }
 
 Result<void> Registry::addTarget(Target t) {
     if (t.name.empty()) return Result<void>::failure("target requires a name");
     if (target(t.name)) return Result<void>::failure("target '" + t.name + "' already exists");
+    LOG_DEBUG("registry: target '", t.name, "' added");
     targets_.push_back(std::move(t));
     return Result<void>::success();
 }
@@ -486,6 +560,7 @@ Result<void> Registry::removeTarget(const std::string& name) {
                                   [&](const Target& x) { return x.name == name; }),
                    targets_.end());
     if (targets_.size() == before) return Result<void>::failure("no target '" + name + "'");
+    LOG_DEBUG("registry: target '", name, "' removed");
     return Result<void>::success();
 }
 
@@ -494,6 +569,7 @@ Result<void> Registry::updateTarget(const std::string& name, Target t) {
         if (x.name == name) {
             t.name = name;
             x = std::move(t);
+            LOG_DEBUG("registry: target '", name, "' updated");
             return Result<void>::success();
         }
     }
@@ -503,6 +579,7 @@ Result<void> Registry::updateTarget(const std::string& name, Target t) {
 Result<void> Registry::addBundle(policy::Bundle b) {
     if (b.name.empty()) return Result<void>::failure("policy bundle requires a name");
     if (bundles_.count(b.name)) return Result<void>::failure("policy bundle '" + b.name + "' already exists");
+    LOG_DEBUG("registry: policy bundle '", b.name, "' added");
     bundles_[b.name] = std::move(b);
     return Result<void>::success();
 }
@@ -511,6 +588,7 @@ Result<void> Registry::updateBundle(const std::string& name, policy::Bundle b) {
     if (!bundles_.count(name)) return Result<void>::failure("no policy bundle '" + name + "'");
     b.name = name;
     bundles_[name] = std::move(b);
+    LOG_DEBUG("registry: policy bundle '", name, "' updated");
     return Result<void>::success();
 }
 
@@ -521,6 +599,7 @@ Result<void> Registry::removeBundle(const std::string& name) {
     for (const auto& r : replications_)
         if (r.policy == name) return Result<void>::failure("policy bundle '" + name + "' is used by replication '" + r.name + "'");
     bundles_.erase(name);
+    LOG_DEBUG("registry: policy bundle '", name, "' removed");
     return Result<void>::success();
 }
 
@@ -585,6 +664,8 @@ std::string Registry::dumpCluster(const Cluster& c) const {
     os << "cluster " << str::quoteShell(c.name) << " {\n";
     if (c.alias != c.name) os << "    alias " << str::quoteShell(c.alias) << ";\n";
     for (const auto& e : c.endpoints) os << "    addr " << str::quoteShell(e) << ";\n";
+    os << "    managed " << (c.managed ? "on" : "off") << ";\n";
+    for (const auto& e : c.adminEndpoints) os << "    admin_endpoint " << str::quoteShell(e) << ";\n";
     os << "    path_style " << (c.pathStyle ? "on" : "off") << ";\n";
     os << "    insecure " << (c.insecure ? "on" : "off") << ";\n";
     if (c.vendor != "generic") os << "    vendor " << str::quoteShell(c.vendor) << ";\n";
@@ -595,6 +676,8 @@ std::string Registry::dumpCluster(const Cluster& c) const {
     if (c.parallel != 4) os << "    parallel " << c.parallel << ";\n";
     os << "    part_size " << units::formatSize(c.partSize) << ";\n";
     if (c.retries != 5) os << "    retries " << c.retries << ";\n";
+    if (c.timeoutSec != 120) os << "    timeout " << c.timeoutSec << "s;\n";
+    if (c.connectTimeoutSec != 10) os << "    connect_timeout " << c.connectTimeoutSec << "s;\n";
     if (!c.description.empty()) os << "    description " << str::quoteShell(c.description) << ";\n";
     os << "}";
     return os.str();

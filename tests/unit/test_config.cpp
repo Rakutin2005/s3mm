@@ -142,3 +142,38 @@ s3mm {
     for (const auto& e : errs) found = found || e.find("outside") != std::string::npos;
     CHECK(found);
 }
+
+TEST(config_validate_without_wrapper) {
+    const char* text = R"(
+cluster src { addr http://x; credential c; }
+cluster dst { addr http://y; credential c; }
+credential c { access_key a; secret_key s; }
+replication r { source src; destination dst; }
+)";
+    auto cfg = config::Config::parse(text, "wrapperless.conf");
+    CHECK(cfg);
+    CHECK(cfg.value().s3mm() != nullptr);
+    CHECK(cfg.value().validate().empty());
+
+    const char* bad = "cluster src { addr http://x; }\nreplication r { source src; destination ghost; }\n";
+    auto cfg2 = config::Config::parse(bad, "wrapperless-bad.conf");
+    CHECK(cfg2);
+    CHECK(!cfg2.value().validate().empty()); // unknown cluster 'ghost'
+}
+
+TEST(config_validate_include_matched_nothing) {
+    // wrapper-less entry point whose drop-in glob matches no files
+    const std::string dir = "/tmp/opencode/cfgtest-empty";
+    fs::removeTree(dir);
+    fs::mkdirp(dir + "/conf.d");
+    fs::writeFileAtomic(dir + "/main.conf", "# entry point\ninclude conf.d/*.conf;\n");
+    auto cfg = config::Config::load(dir + "/main.conf");
+    CHECK(cfg);
+    CHECK(cfg.value().validate().empty());
+
+    fs::writeFileAtomic(dir + "/conf.d/00-core.conf", "socket /tmp/s.sock;\n");
+    auto cfg2 = config::Config::load(dir + "/main.conf");
+    CHECK(cfg2);
+    CHECK(cfg2.value().validate().empty());
+    CHECK_EQ(cfg2.value().s3mm()->value("socket"), std::string("/tmp/s.sock"));
+}

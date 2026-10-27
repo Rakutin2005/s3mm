@@ -8,7 +8,7 @@ namespace s3mm::cli {
 
 /// Global options collected before the command is parsed.
 struct Options {
-    std::string config = "/etc/s3mm/s3mm.conf";
+    std::string config = "/etc/s3mm/s3mmd.conf";
     std::string socket; // empty: $S3MM_SOCKET → config settings.socket → default
     Format format = Format::Table;
     bool permanent = false; // ask the daemon to write changes back to config

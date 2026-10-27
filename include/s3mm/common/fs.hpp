@@ -5,6 +5,8 @@
 #include <string_view>
 #include <vector>
 
+#include "s3mm/common/result.hpp"
+
 namespace s3mm::fs {
 
 std::optional<std::string> readFile(const std::string& path);
@@ -26,7 +28,7 @@ std::optional<unsigned> permissions(const std::string& path);
 bool setPermissions(const std::string& path, unsigned mode);
 
 /// Read a file that must not be readable by group/other; returns error string otherwise.
-std::optional<std::string> readSecretFile(const std::string& path);
+Result<std::string> readSecretFile(const std::string& path);
 
 std::string joinPath(std::string_view a, std::string_view b);
 std::string dirname(const std::string& path);

@@ -3,6 +3,7 @@
 #include <chrono>
 
 #include "s3mm/common/crypto.hpp"
+#include "s3mm/common/log.hpp"
 #include "s3mm/common/time.hpp"
 
 namespace s3mm::peer {
@@ -17,12 +18,21 @@ std::string encodeFrame(const Value& frame) {
 }
 
 Result<Value> decodeFrame(const std::string& line) {
-    if (line.size() > kMaxFrameBytes)
+    if (line.size() > kMaxFrameBytes) {
+        LOG_ERROR("wire: peer frame too large: ", line.size(), " bytes (max ", kMaxFrameBytes, ")");
         return Result<Value>::failure("peer frame too large (" + std::to_string(line.size()) + " bytes)");
+    }
     std::string error;
     auto v = Value::parseJson(line, &error);
-    if (!error.empty()) return Result<Value>::failure("peer frame parse error: " + error);
-    if (!v.isObject()) return Result<Value>::failure("peer frame is not a JSON object");
+    if (!error.empty()) {
+        LOG_ERROR("wire: peer frame parse error: ", error, " (", line.size(), " bytes: ", log::clip(line), ")");
+        return Result<Value>::failure("peer frame parse error: " + error);
+    }
+    if (!v.isObject()) {
+        LOG_ERROR("wire: peer frame is not a JSON object: ", log::clip(line));
+        return Result<Value>::failure("peer frame is not a JSON object");
+    }
+    LOG_DEBUG("wire: decoded frame type='", v.getString("type"), "' ", line.size(), " bytes");
     return Result<Value>(std::move(v));
 }
 
@@ -72,17 +82,23 @@ static std::vector<std::string> stringArray(const Value& parent, const char* key
 }
 
 Result<Inventory> Inventory::fromJson(const Value& v) {
-    if (!v.isObject()) return Result<Inventory>::failure("inventory: not an object");
+    if (!v.isObject()) {
+        LOG_WARN("wire: inventory is not an object");
+        return Result<Inventory>::failure("inventory: not an object");
+    }
     Inventory inv;
     inv.nodeId = v.getString("node");
-    if (inv.nodeId.empty()) return Result<Inventory>::failure("inventory: missing node id");
+    if (inv.nodeId.empty()) {
+        LOG_WARN("wire: inventory without node id: ", log::clip(v.toJson()));
+        return Result<Inventory>::failure("inventory: missing node id");
+    }
     if (const Value* r = v.find("revision")) inv.revision = r->asInt(0);
     if (const Value* g = v.find("generated_at")) inv.generatedAtSec = g->asInt(0);
     if (const Value* arr = v.find("clusters"); arr && arr->isArray()) {
         for (const auto& cv : arr->items()) {
             InventoryCluster c;
             c.id = cv.getString("id");
-            if (c.id.empty()) continue;
+            if (c.id.empty()) { LOG_WARN("wire: inventory of '", inv.nodeId, "': cluster entry without id ignored"); continue; }
             c.alias = cv.getString("alias");
             c.vendor = cv.getString("vendor");
             c.zone = cv.getString("zone");
@@ -94,7 +110,7 @@ Result<Inventory> Inventory::fromJson(const Value& v) {
         for (const auto& rv : arr->items()) {
             RemoteReplication r;
             r.name = rv.getString("name");
-            if (r.name.empty()) continue;
+            if (r.name.empty()) { LOG_WARN("wire: inventory of '", inv.nodeId, "': replication entry without name ignored"); continue; }
             r.source = rv.getString("source");
             r.destination = rv.getString("destination");
             if (const Value* p = rv.find("paused")) r.paused = p->asBool(false);
@@ -102,6 +118,8 @@ Result<Inventory> Inventory::fromJson(const Value& v) {
         }
     }
     inv.localClusters = stringArray(v, "local_clusters");
+    LOG_DEBUG("wire: inventory of '", inv.nodeId, "' rev ", inv.revision, ": ", inv.clusters.size(), " clusters, ",
+              inv.replications.size(), " replications, ", inv.localClusters.size(), " local clusters");
     return Result<Inventory>(std::move(inv));
 }
 
@@ -131,7 +149,10 @@ Value TaskSpec::toJson() const {
 }
 
 Result<TaskSpec> TaskSpec::fromJson(const Value& v) {
-    if (!v.isObject()) return Result<TaskSpec>::failure("task: not an object");
+    if (!v.isObject()) {
+        LOG_WARN("wire: task is not an object");
+        return Result<TaskSpec>::failure("task: not an object");
+    }
     TaskSpec t;
     t.id = v.getString("id");
     t.origin = v.getString("origin");
@@ -149,8 +170,16 @@ Result<TaskSpec> TaskSpec::fromJson(const Value& v) {
     if (const Value* m = v.find("meta"); m && m->isObject())
         for (const auto& [k, val] : m->members())
             if (val.isString()) t.meta[k] = val.asString();
-    if (t.id.empty()) return Result<TaskSpec>::failure("task: missing id");
-    if (t.bucket.empty() || t.key.empty()) return Result<TaskSpec>::failure("task: missing bucket/key");
+    if (t.id.empty()) {
+        LOG_WARN("wire: task without id: ", log::clip(v.toJson()));
+        return Result<TaskSpec>::failure("task: missing id");
+    }
+    if (t.bucket.empty() || t.key.empty()) {
+        LOG_WARN("wire: task ", t.id, " missing bucket/key");
+        return Result<TaskSpec>::failure("task: missing bucket/key");
+    }
+    LOG_DEBUG("wire: task ", t.id, " kind=", t.kind, " origin=", t.origin, " repl=", t.replication, " ",
+              t.bucket, "/", t.key, " size=", t.size, " hops=", t.trail.size());
     return Result<TaskSpec>(std::move(t));
 }
 
@@ -165,16 +194,26 @@ Value TaskResult::toJson() const {
 }
 
 Result<TaskResult> TaskResult::fromJson(const Value& v) {
-    if (!v.isObject()) return Result<TaskResult>::failure("task result: not an object");
+    if (!v.isObject()) {
+        LOG_WARN("wire: task result is not an object");
+        return Result<TaskResult>::failure("task result: not an object");
+    }
     TaskResult r;
     r.taskId = v.getString("task");
     r.node = v.getString("node");
     r.status = v.getString("status");
     r.reason = v.getString("reason");
     if (const Value* b = v.find("bytes")) r.bytesShipped = (uint64_t)b->asInt(0);
-    if (r.taskId.empty()) return Result<TaskResult>::failure("task result: missing task id");
-    if (r.status != "ok" && r.status != "denied" && r.status != "failed")
+    if (r.taskId.empty()) {
+        LOG_WARN("wire: task result without task id");
+        return Result<TaskResult>::failure("task result: missing task id");
+    }
+    if (r.status != "ok" && r.status != "denied" && r.status != "failed") {
+        LOG_WARN("wire: task result ", r.taskId, " has unknown status '", r.status, "'");
         return Result<TaskResult>::failure("task result: unknown status '" + r.status + "'");
+    }
+    LOG_DEBUG("wire: task result ", r.taskId, " from ", r.node, ": ", r.status, " bytes=", r.bytesShipped,
+              r.reason.empty() ? "" : " reason=", r.reason);
     return Result<TaskResult>(std::move(r));
 }
 
