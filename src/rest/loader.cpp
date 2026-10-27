@@ -1,5 +1,4 @@
 #include "s3mm/rest/loader.hpp"
-#include <filesystem>
 
 #include <dlfcn.h>
 
@@ -41,31 +40,16 @@ Result<void> RestModuleLoader::loadFile(const std::string& path) {
     return Result<void>::success();
 }
 
-Result<void> RestModuleLoader::loadDir(const std::string& dir) {
-    std::error_code ec;
-    LOG_DEBUG("rest modules: scanning directory ", dir);
-    if (!std::filesystem::exists(dir, ec)) {
-        LOG_WARN("rest modules: directory not found: ", dir, ec ? " (" + ec.message() + ")" : std::string());
-        return Result<void>::failure("modules directory not found: " + dir);
-    }
-    size_t candidates = 0;
-    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
-        if (!entry.is_regular_file()) continue;
-        if (entry.path().extension() != ".so") {
-            LOG_DEBUG("rest modules: skipping ", entry.path().string(), " (not a .so)");
-            continue;
-        }
-        ++candidates;
-        // The directory is shared with the storage modules (s3mm_mod_*.so),
-        // which have no REST entry point: skip them, and keep going past a
-        // broken module instead of dropping every module after it.
-        auto loaded = loadFile(entry.path().string());
-        if (!loaded && loaded.error().rfind("missing s3mm_rest_module_entry", 0) != 0)
-            LOG_WARN("rest modules: skipping ", entry.path().string(), ": ", loaded.error());
-    }
-    if (ec) LOG_WARN("rest modules: error while iterating ", dir, ": ", ec.message());
-    LOG_INFO("rest modules: scanned ", dir, ": ", candidates, " shared objects, ", loaded_.size(), " REST modules loaded");
-    return Result<void>::success();
+Result<IRestModule*> RestModuleLoader::loadModule(const std::string& name, const std::string& path,
+                                                 const std::string& modulesDir) {
+    std::string file = path.empty() ? modulesDir + "/s3mmws_mod_" + name + ".so" : path;
+    LOG_INFO("rest modules: loading module '", name, "' from ", file);
+    auto loaded = loadFile(file);
+    if (!loaded) return Result<IRestModule*>::failure("module '" + name + "': " + loaded.error());
+    IRestModule* module = loaded_.back().second;
+    if (module->info().name != name)
+        LOG_WARN("rest modules: ", file, " identifies itself as '", module->info().name, "', configured as '", name, "'");
+    return module;
 }
 
 std::vector<IRestModule*> RestModuleLoader::modules() const {

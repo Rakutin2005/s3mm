@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "s3mm/common/result.hpp"
+#include "s3mm/config/config.hpp"
 #include "s3mm/rest/server.hpp"
 #include "s3mm/rest/router.hpp"
 #include "s3mm/rest/loader.hpp"
@@ -47,6 +48,7 @@ struct Options {
     bool validateOnly = false;
     AuthSettings auth;
     WsClusterSettings wscluster;
+    std::vector<config::Node> modules; // `module <name> { ... }` blocks
 };
 
 class RestDaemon {

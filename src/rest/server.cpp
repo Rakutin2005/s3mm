@@ -34,6 +34,44 @@ std::string describeHeaders(const std::map<std::string, std::string>& headers) {
 }
 }
 
+// application/x-www-form-urlencoded / RFC 3986 percent-decoding ('+' only in queries).
+static std::string urlDecode(const std::string& in, bool plusIsSpace) {
+    std::string out;
+    out.reserve(in.size());
+    for (size_t i = 0; i < in.size(); ++i) {
+        char c = in[i];
+        if (c == '+' && plusIsSpace) {
+            out += ' ';
+        } else if (c == '%' && i + 2 < in.size() && std::isxdigit((unsigned char)in[i + 1]) &&
+                   std::isxdigit((unsigned char)in[i + 2])) {
+            out += (char)std::stoi(in.substr(i + 1, 2), nullptr, 16);
+            i += 2;
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+static const char* reasonPhrase(int status) {
+    switch (status) {
+        case 200: return "OK";
+        case 201: return "Created";
+        case 204: return "No Content";
+        case 206: return "Partial Content";
+        case 400: return "Bad Request";
+        case 401: return "Unauthorized";
+        case 403: return "Forbidden";
+        case 404: return "Not Found";
+        case 405: return "Method Not Allowed";
+        case 409: return "Conflict";
+        case 500: return "Internal Server Error";
+        case 502: return "Bad Gateway";
+        case 503: return "Service Unavailable";
+        default: return status < 400 ? "OK" : "Error";
+    }
+}
+
 uint64_t currentRequestId() { return gCurrentRequest; }
 
 std::string requestTag() { return "req#" + std::to_string(gCurrentRequest) + " "; }
@@ -150,12 +188,13 @@ void HttpServer::acceptOne(const Handler& handler) {
                 size_t amp = query.find('&', start);
                 std::string pair = query.substr(start, amp == std::string::npos ? std::string::npos : amp - start);
                 auto eq = pair.find('=');
-                if (eq != std::string::npos) req.query[pair.substr(0, eq)] = pair.substr(eq + 1);
-                else if (!pair.empty()) req.query[pair] = "";
+                if (eq != std::string::npos) req.query[urlDecode(pair.substr(0, eq), true)] = urlDecode(pair.substr(eq + 1), true);
+                else if (!pair.empty()) req.query[urlDecode(pair, true)] = "";
                 if (amp == std::string::npos) break;
                 start = amp + 1;
             }
         }
+        req.path = urlDecode(req.path, false);
         // Body based on Content-Length.
         auto it = req.headers.find("Content-Length");
         size_t len = 0;
@@ -215,7 +254,7 @@ void HttpServer::acceptOne(const Handler& handler) {
     }
 
     std::ostringstream out;
-    out << "HTTP/1.1 " << res.status << " " << (res.status == 200 ? "OK" : "ERROR") << "\r\n";
+    out << "HTTP/1.1 " << res.status << " " << reasonPhrase(res.status) << "\r\n";
     if (res.headers.find("Content-Type") == res.headers.end()) res.headers["Content-Type"] = "application/json";
     for (const auto& [k, v] : res.headers) out << k << ": " << v << "\r\n";
     out << "Access-Control-Allow-Origin: *\r\n";

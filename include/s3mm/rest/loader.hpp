@@ -11,7 +11,8 @@ namespace s3mm::rest {
 class RestModuleLoader {
 public:
     ~RestModuleLoader();
-    Result<void> loadDir(const std::string& dir);
+    /// Load the module `name` from `path`, or from <modulesDir>/s3mmws_mod_<name>.so.
+    Result<IRestModule*> loadModule(const std::string& name, const std::string& path, const std::string& modulesDir);
     Result<void> loadFile(const std::string& path);
     std::vector<IRestModule*> modules() const;
 private:

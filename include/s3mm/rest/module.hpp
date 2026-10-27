@@ -8,6 +8,7 @@
 #include "s3mm/common/result.hpp"
 #include "s3mm/common/value.hpp"
 #include "s3mm/cli/client.hpp"
+#include "s3mm/config/config.hpp"
 
 namespace s3mm::rest {
 
@@ -53,10 +54,36 @@ private:
     std::string modulesDir_;
 };
 
+/// A REST module (s3mmws_mod_<name>.so) is loaded only when the s3mmws
+/// configuration has a `module <name> { ... }` block; the block is handed to
+/// configure() before onLoad(). Its routes should live under /ext/<name>/.
+///
+/// uiExtension() describes a page that the web UI adds to its navigation
+/// while the module is loaded (GET /ui/extensions). Schema:
+///   { "id": "<name>", "title": "...", "icon": "cluster|api|cloud|database|
+///     link|monitor|setting", "refresh": <seconds>, "sections": [ <section> ] }
+/// <section>:
+///   { "type": "kv",    "title": "...", "source": "/ext/..", "path": "a.b",
+///     "fields": [ {"key": "...", "title": "..."} ] }            // object view
+///   { "type": "table", "title": "...", "source": "/ext/..", "path": "a.b",
+///     "rowKey": "id", "columns": [ {"key": "...", "title": "...",
+///     "type": "text|bool|tag|json"} ],
+///     "rowActions": [ <action> ] }                              // array view
+///   { "type": "actions", "title": "...", "actions": [ <action> ] }
+///   { "type": "json",  "title": "...", "source": "/ext/..", "path": "a.b" }
+/// <action>: { "label": "...", "method": "POST|PUT|DELETE",
+///   "endpoint": "/ext/..?x={field}", "body": { "k": "{field}" },
+///   "fields": [ {"name": "...", "label": "...", "type": "text|bool|number",
+///   "required": true} ], "confirm": "...", "danger": true }
+///   "{name}" placeholders are filled from the form fields or the table row.
 class IRestModule {
 public:
     virtual ~IRestModule() = default;
     virtual RestModuleInfo info() const = 0;
+    /// `module <name> { ... }` block of the s3mmws configuration.
+    virtual Result<void> configure(const config::Node&) { return Result<void>::success(); }
+    /// Web UI page of the module, Value::null() when it has none.
+    virtual Value uiExtension() const { return Value::null(); }
     virtual void onLoad(RestContext&) {}
     virtual bool authenticate(const RestRequest&, RestResponse&) { return true; }
     virtual bool process(const RestRequest&, RestResponse&) { return false; }

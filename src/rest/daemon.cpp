@@ -225,8 +225,21 @@ void RestDaemon::registerDefaults() {
             v.set("name", Value::str(info.name));
             v.set("version", Value::str(info.version));
             v.set("vendor", Value::str(info.vendor));
+            v.set("ui", Value::boolean(!m->uiExtension().isNull()));
             arr.push(v);
         }
+        res.json(arr);
+    });
+    router_.add("GET", "/ui/extensions", [this](const RestRequest&, RestResponse& res) {
+        Value arr = Value::array();
+        for (const auto* m : modules_) {
+            Value ext = m->uiExtension();
+            if (ext.isNull() || !ext.isObject()) continue;
+            if (ext.getString("id").empty()) ext.set("id", Value::str(m->info().name));
+            ext.set("module", Value::str(m->info().name));
+            arr.push(ext);
+        }
+        LOG_DEBUG(who(), "ui: ", arr.items().size(), " web UI extension(s) served");
         res.json(arr);
     });
     router_.add("POST", "/rpc", [this](const RestRequest& req, RestResponse& res) {
@@ -1172,6 +1185,16 @@ int RestDaemon::run() {
                 LOG_ERROR("config: registry could not be built from ", options_.config, ": ", reg.error(),
                           "; S3 browsing and proxying are unavailable");
             }
+            // `module <name> { ... }` blocks: top level or inside s3mmws { }
+            for (const auto& r : cfg.value().roots())
+                if (r.name == "module") options_.modules.push_back(r);
+            if (const config::Node* s3mmRoot = cfg.value().s3mm())
+                for (const auto* m : s3mmRoot->findAll("module")) options_.modules.push_back(*m);
+            for (const auto& r : cfg.value().roots())
+                if (r.name == "s3mmws" && r.block)
+                    for (const auto* m : r.findAll("module")) options_.modules.push_back(*m);
+            for (const auto& m : options_.modules)
+                LOG_INFO("config: module '", m.argOr(0), "' configured at ", m.file, ":", m.line);
             // parse s3mmws auth block
             const config::Node* s3mm = cfg.value().s3mm();
             const config::Node* ws = nullptr;
@@ -1406,17 +1429,31 @@ int RestDaemon::run() {
         LOG_DEBUG("config: modules dir not set, using ", options_.modulesDir);
     }
 
-    auto loaded = loader_.loadDir(options_.modulesDir);
-    if (!loaded) LOG_WARN("rest modules: ", loaded.error());
-
     RestContext ctx(daemonClient_, options_.modulesDir);
-    for (auto* m : loader_.modules()) {
-        LOG_DEBUG("rest modules: initializing '", m->info().name, "'");
+    for (const auto& block : options_.modules) {
+        const std::string name = block.argOr(0);
+        if (name.empty()) {
+            LOG_ERROR("rest modules: 'module' at ", block.file, ":", block.line, " has no name, ignored");
+            continue;
+        }
+        auto loaded = loader_.loadModule(name, block.value("path"), options_.modulesDir);
+        if (!loaded) {
+            LOG_ERROR("rest modules: ", loaded.error(), "; the module stays disabled");
+            continue;
+        }
+        IRestModule* m = loaded.value();
+        if (auto configured = m->configure(block); !configured) {
+            LOG_ERROR("rest modules: module '", name, "' rejected its configuration (", block.file, ":", block.line,
+                      "): ", configured.error(), "; the module stays disabled");
+            continue;
+        }
+        LOG_DEBUG("rest modules: initializing '", name, "'");
         m->onLoad(ctx);
         m->registerRoutes(router_);
         modules_.push_back(m);
+        LOG_NOTICE("rest modules: module '", name, "' active", m->uiExtension().isNull() ? "" : " (with web UI page)");
     }
-    LOG_INFO("rest modules: ", modules_.size(), " active");
+    LOG_INFO("rest modules: ", modules_.size(), " of ", options_.modules.size(), " configured module(s) active");
 
     registerDefaults();
     LOG_DEBUG("startup: built-in routes registered");
@@ -1517,6 +1554,8 @@ int RestDaemon::run() {
                         else if (req.path.rfind("/browse",0)==0) resource="explorer";
                         else if (req.path.rfind("/status",0)==0) resource="clusters";
                         else if (req.path.rfind("/modules",0)==0) resource="clusters";
+                        else if (req.path.rfind("/ui/",0)==0) resource="clusters";
+                        else if (req.path.rfind("/ext/",0)==0) resource="s3mmws";
                         bool write = (req.method != "GET");
                         std::string perm = resource + ":" + (write ? "write" : "read");
                         // admin-ish manage for rbac writes

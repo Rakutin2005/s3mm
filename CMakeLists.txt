@@ -143,6 +143,18 @@ target_include_directories(s3mm_mod_kafka PRIVATE ${CMAKE_SOURCE_DIR}/s3mme/incl
 s3mm_module(rabbitmq modules/rabbitmq/mod_rabbitmq.cpp)
 target_include_directories(s3mm_mod_rabbitmq PRIVATE ${CMAKE_SOURCE_DIR}/s3mme/include)
 
+# ----------------------------------------------------------- s3mmws modules
+# Loaded by s3mmws only when its configuration has `module <name> { ... }`.
+function(s3mmws_module name)
+  add_library(s3mmws_mod_${name} MODULE ${ARGN})
+  target_link_libraries(s3mmws_mod_${name} PRIVATE s3mm_core)
+  set_target_properties(s3mmws_mod_${name} PROPERTIES
+    PREFIX "" OUTPUT_NAME "s3mmws_mod_${name}"
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/modules)
+endfunction()
+
+s3mmws_module(s3mmc modules/s3mmws/s3mmc/mod_s3mmc.cpp)
+
 # ---------------------------------------------------------------------- tests
 enable_testing()
 add_executable(s3mm_tests
